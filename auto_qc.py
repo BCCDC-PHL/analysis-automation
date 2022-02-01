@@ -44,7 +44,7 @@ def build_workflow_command(run_dir):
     work_dir_uuid = uuid.uuid4()
     work_dir = os.path.join(run_dir, 'work-' + str(work_dir_uuid))
     workflow_cmd = (f'{nextflow_base_cmd} {pipeline_name} -profile conda --cache ~/.conda/envs -r {pipeline_version}'
-                    f'--run_dir {run_dir} --instrument_type {instrument_type} -work {work_dir} --outdir {outdir}')
+                    f'--run_dir {run_dir} --instrument_type {instrument_type} -work-dir {work_dir} --outdir {outdir}')
 
     return workflow_cmd
 
