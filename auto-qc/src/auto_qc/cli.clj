@@ -1,5 +1,6 @@
 (ns auto-qc.cli
-  (:require [clojure.string :as str]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 (def version "v0.1.0")
 
@@ -16,8 +17,8 @@
 
 
 (def options
-  [["-r" "--runs-dir RUN_DIR"]
-   ["-e" "--exclude EXCLUDE_FILE"]
+  [["-c" "--config CONFIG_FILE" "Config file"
+    :validate [#(.exists (io/as-file %)) #(str "Config file '" % "' does not exist.")]]
    ["-h" "--help"]
    ["-v" "--version"]])
 
