@@ -1,5 +1,7 @@
 (ns auto-qc.core
   (:require [clojure.java.io :as io]
+            [clojure.edn :as edn]
+            [clojure.set :as set]
             [clojure.tools.logging :as log]
             [clojure.pprint :refer [pprint]]
             [clojure.tools.cli :refer [parse-opts]]
@@ -8,6 +10,26 @@
             [clojure.core.async :as async :refer [go go-loop chan onto-chan! <! <!! >! >!! timeout]]
             [auto-qc.cli :as cli])
   (:gen-class))
+
+
+(defn load-edn
+  "Load edn from an io/reader source (filename or io/resource).
+   https://clojuredocs.org/clojure.edn/read#example-5a68f384e4b09621d9f53a79"
+  [source]
+  (try
+    (with-open [r (io/reader source)]
+      (edn/read (java.io.PushbackReader. r)))
+
+    (catch java.io.IOException e
+      (printf "Couldn't open '%s': %s\n" source (.getMessage e)))
+    (catch RuntimeException e
+      (printf "Error parsing edn file '%s': %s\n" source (.getMessage e)))))
+
+
+(defn matches-run-directory-regex?
+  "Check that the directory name matches one of the standard illumina directory name formats."
+  [run-dir]
+  )
 
 
 (defn upload-complete?
@@ -53,6 +75,8 @@
   ;;
   ;; Command-line argument parsing
   (def opts (parse-opts args cli/options))
+  (when (not (empty? (:errors opts)))
+    (cli/exit 1 (str/join \newline (:errors opts))))
 
   ;;
   ;; Handle -h and --help flags
@@ -69,19 +93,43 @@
   ;; In-memory db for co-ordinated state
   (def db (atom {}))
 
+
+  (defn update-config!
+    "Read config from file and insert into db under key :config"
+    [config-file-path db]
+    (if (.exists (io/file config-file-path))
+      (let [config (load-edn config-file-path)]
+        (swap! db (fn [x] (assoc x :config config))))))
+  
   ;;
-  ;; Load list of excluded runs from the --exclude file
+  ;; Load config to db
+  ;; Loads once synchronously, then asynchronously refresh every 60 seconds
+  (let [config-file-path (get-in opts [:options :config])]
+    (when (some? config-file-path)
+      (do
+        (update-config! config-file-path db)
+        (go-loop []
+          (update-config! config-file-path db)
+          (log/debug (str "Current config: " (:config @db)))
+          (<! (timeout 60000))
+          (recur)))))
+  
+  ;;
+  ;; Load list of excluded runs from all exclude files
   ;; Store set of run IDs under :excluded-run-ids in db
   ;; Refresh every 10 seconds
-  (let [exclude-file-path (get-in opts [:options :exclude])]
-    (if exclude-file-path
-      (go-loop []
-        (if (.exists (io/file exclude-file-path))
-          (with-open [rdr (io/reader exclude-file-path)]
-            (swap! db (fn [x] (assoc x :excluded-run-ids (into #{} (line-seq rdr)))))))
-        (log/debug (str "Excluded runs: " (:excluded-run-ids @db)))
-        (<! (timeout 10000))
-        (recur))))
+  (go-loop []
+    (let [exclude-file-paths (get-in @db [:config :exclude-files])]
+      (when (some? exclude-file-paths)
+        (dosync
+         (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
+         (doseq [exclude-file-path exclude-file-paths]
+           (if (.exists (io/file exclude-file-path))
+             (with-open [rdr (io/reader exclude-file-path)]
+               (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))))
+      (log/debug (str "Excluded runs: " (:excluded-run-ids @db)))
+      (<! (timeout 10000))
+      (recur)))
 
   
   (def runs-to-analyze-chan (chan))
@@ -94,14 +142,16 @@
   ;; Park for 10 seconds
   ;; Recur
   (go-loop []
-    (->> (get-in opts [:options :runs-dir])
-         io/file
-         .listFiles
-         (map (memfn getCanonicalPath))
-         (filter upload-complete?)
-         (filter #(not (analyzed? %)))
-         (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %)))))
-         (#(doseq [run %] (go (>! runs-to-analyze-chan run)))))
+    (let [run-dirs (get-in @db [:config :run-dirs])]
+      (doseq [run-dir run-dirs]
+        (->> run-dir
+             io/file
+             .listFiles
+             (map (memfn getCanonicalPath))
+             (filter upload-complete?)
+             (filter #(not (analyzed? %)))
+             (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %)))))
+             (#(doseq [run %] (go (>! runs-to-analyze-chan run)))))))
     (<! (timeout 10000))
     (recur))
 
@@ -112,7 +162,7 @@
   ;; Run nextflow pipeline
   ;; Recur with the next directory path on the channel
   (loop [run (<!! runs-to-analyze-chan)]
-    (if (not (nil? run))
+    (if (some? run)
       (do
         (log/info (str "Analysis started: " run))
         (run-nextflow! {:run-dir run
@@ -127,8 +177,7 @@
   ;;
   ;; Useful forms for REPL-driven development
 
-  (def opts {:options {:runs-dir ""
-                       :exclude ""}})
+  (def opts {:options {:config "config.edn"}})
   
   (defn mock-analyze!
     ""
