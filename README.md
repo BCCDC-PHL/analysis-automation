@@ -9,8 +9,7 @@ Run the [BCCDC-PHL/routine-sequence-qc](https://github.com/BCCDC-PHL/routine-seq
 Usage: java -jar auto-qc.jar OPTIONS
 
 Options:
-  -r, --runs-dir RUN_DIR
-  -e, --exclude EXCLUDE_FILE
+  -c, --config CONFIG_FILE Config file.
   -h, --help
   -v, --version
 ```
