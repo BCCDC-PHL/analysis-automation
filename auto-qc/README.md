@@ -1,6 +1,9 @@
 # Auto QC
 Run the [BCCDC-PHL/routine-sequence-qc](https://github.com/BCCDC-PHL/routine-sequence-qc) pipeline.
 
+### Building
+A build script (`build.sh`) is included in this repo. The `clj` command-line tool is required for building. Follow [this guide](https://clojure.org/guides/getting_started) to install. A standalone `.jar` file will be compiled under the `target` directory.
+
 ### Usage
 ```
 Usage: java -jar auto-qc.jar OPTIONS
