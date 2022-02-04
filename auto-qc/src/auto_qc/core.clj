@@ -29,7 +29,11 @@
 (defn matches-run-directory-regex?
   "Check that the directory name matches one of the standard illumina directory name formats."
   [run-dir]
-  )
+  (->> run-dir
+       io/file
+       .getName
+       (re-matches #"\d{6}_[A-Z0-9]+_\d+_[A-Z0-9\-]+")
+       some?))
 
 
 (defn upload-complete?
@@ -135,9 +139,11 @@
   (def runs-to-analyze-chan (chan))
 
   ;;
-  ;; Scan through sub-directories of --runs-dir
+  ;; Scan through contents of run-dirs
+  ;; Include only directories (not files)
+  ;; Exclude directories that don't match the illumina run directory naming scheme
   ;; Exclude those without 'upload_complete.json' file
-  ;; Exclude those in the --exclude file
+  ;; Exclude those runs whose run ID is listed in an exclude file
   ;; Add the remaining directories to the runs-to-analyze channel
   ;; Park for 10 seconds
   ;; Recur
@@ -148,6 +154,8 @@
              io/file
              .listFiles
              (map (memfn getCanonicalPath))
+             (filter #(.isDirectory (io/file %)))
+             (filter matches-run-directory-regex?)
              (filter upload-complete?)
              (filter #(not (analyzed? %)))
              (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %)))))
