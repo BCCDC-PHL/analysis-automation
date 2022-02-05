@@ -26,6 +26,14 @@
       (printf "Error parsing edn file '%s': %s\n" source (.getMessage e)))))
 
 
+(defn update-config!
+  "Read config from file and insert into db under key :config"
+  [config-file-path db]
+  (if (.exists (io/file config-file-path))
+    (let [config (load-edn config-file-path)]
+      (swap! db (fn [x] (assoc x :config config))))))
+
+
 (defn matches-run-directory-regex?
   "Check that the directory name matches one of the standard illumina directory name formats."
   [run-dir]
@@ -101,15 +109,7 @@
 
   ;;
   ;; In-memory db for co-ordinated state
-  (def db (atom {}))
-
-
-  (defn update-config!
-    "Read config from file and insert into db under key :config"
-    [config-file-path db]
-    (if (.exists (io/file config-file-path))
-      (let [config (load-edn config-file-path)]
-        (swap! db (fn [x] (assoc x :config config))))))
+  (defonce db (atom {}))
   
   ;;
   ;; Load config to db
@@ -179,7 +179,7 @@
     (if (some? run)
       (do
         (log/info (str "Analysis started: " run))
-        (run-nextflow! {:run-dir run
+        (mock-analyze! {:run-dir run
                         :revision "main"})
         (log/info (str "Analysis complete: " run))))
     (recur (<!! runs-to-analyze-chan))))
@@ -191,13 +191,25 @@
   ;;
   ;; Useful forms for REPL-driven development
 
-  (def opts {:options {:config "config.edn"}})
+  (def opts {:options {:config "dev-config.edn"}})
+
+  ;; Reload config
+  (update-config! (get-in opts [:options :config]) db)
+
+  ;; Clear excluded run list
+  (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
+
+  ;; Reload excluded run list from exclude files
+  (doseq [exclude-file-path (get-in @db [:config :exclude-files])]
+    (if (.exists (io/file exclude-file-path))
+      (with-open [rdr (io/reader exclude-file-path)]
+        (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))
   
   (defn mock-analyze!
     ""
     [{:keys [run-dir]}]
     (do
-      (log/info (str "Analyzing: " run-dir))
+      (log/info (str "Analysis started: " run-dir))
       (Thread/sleep 10000)
       (log/info (str "Analysis complete: " run-dir))))
   )
