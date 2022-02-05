@@ -6,7 +6,7 @@
             [clojure.pprint :refer [pprint]]
             [clojure.tools.cli :refer [parse-opts]]
             [clojure.string :as str]
-            [clojure.java.shell :refer [sh]]
+            [clojure.java.shell :as shell :refer [sh]]
             [clojure.core.async :as async :refer [go go-loop chan onto-chan! <! <!! >! >!! timeout]]
             [auto-qc.cli :as cli])
   (:gen-class))
@@ -59,17 +59,23 @@
         log-file (str/join \/ [outdir "nextflow.log"])]
     (do
       (sh "mkdir" "-p" outdir)
-      (apply sh ["nextflow"
-                 "-q"
-                 "-log" log-file
-                 "run" "BCCDC-PHL/routine-sequence-qc"
-                 "-profile" "conda"
-                 "--cache" (str/join \/ [(System/getProperty "user.home") ".conda/envs"])
-                 "-r" revision
-                 "--run_dir" run-dir
-                 "-work-dir" work-dir
-                 "--outdir" outdir])
-      (sh "rm" "-r" work-dir))))
+      (sh "chmod" "750" outdir)
+      (sh "mkdir" "-p" work-dir)
+      (sh "chmod" "750" work-dir)
+      (shell/with-sh-dir outdir
+        (apply sh ["nextflow"
+                   "-q"
+                   "-log" log-file
+                   "run" "BCCDC-PHL/routine-sequence-qc"
+                   "-profile" "conda"
+                   "--cache" (str/join \/ [(System/getProperty "user.home") ".conda/envs"])
+                   "-r" revision
+                   "--run_dir" run-dir
+                   "-work-dir" work-dir
+                   "--outdir" "."]))
+      (sh "rm" "-r" work-dir)
+      (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
+      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+"))))
 
 
 (defn -main
