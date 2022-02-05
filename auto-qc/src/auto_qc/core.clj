@@ -58,6 +58,27 @@
     (.exists (io/file analysis-dir-path))))
 
 
+(defn currently-analyzing?
+  ""
+  [run-dir]
+  (= (:currently-analyzing @db) run-dir))
+
+
+(defn scan-for-runs-to-analyze!
+  ""
+  [run-dirs]
+  (doseq [run-dir run-dirs]
+    (->> run-dir
+         io/file
+         .listFiles
+         (map (memfn getCanonicalPath))
+         (filter #(.isDirectory (io/file %)))
+         (filter matches-run-directory-regex?)
+         (filter upload-complete?)
+         (filter #(not (analyzed? %)))
+         (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %))))))))
+
+
 (defn run-nextflow!
   "Run the BCCDC-PHL/routine-sequence-qc pipeline on a run directory.
    When the analysis completes, delete the 'work' directory."
@@ -66,6 +87,7 @@
         outdir (str/join \/ [run-dir "RoutineQC"])
         log-file (str/join \/ [outdir "nextflow.log"])]
     (do
+      (swap! db assoc :currently-analyzing run-dir)
       (sh "mkdir" "-p" outdir)
       (sh "chmod" "750" outdir)
       (sh "mkdir" "-p" work-dir)
@@ -155,17 +177,10 @@
   ;; Recur
   (go-loop []
     (let [run-dirs (get-in @db [:config :run-dirs])]
-      (doseq [run-dir run-dirs]
-        (->> run-dir
-             io/file
-             .listFiles
-             (map (memfn getCanonicalPath))
-             (filter #(.isDirectory (io/file %)))
-             (filter matches-run-directory-regex?)
-             (filter upload-complete?)
-             (filter #(not (analyzed? %)))
-             (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %)))))
-             (#(doseq [run %] (go (>! runs-to-analyze-chan run)))))))
+      (->> (scan-for-runs-to-analyze! run-dirs)
+           (filter #(not (currently-analyzing? %)))
+           first
+           (>! runs-to-analyze-chan)))
     (<! (timeout 10000))
     (recur))
 
@@ -209,7 +224,10 @@
     ""
     [{:keys [run-dir]}]
     (do
+      (swap! db assoc :currently-analyzing run-dir)
       (log/info (str "Analysis started: " run-dir))
-      (Thread/sleep 10000)
-      (log/info (str "Analysis complete: " run-dir))))
+      (go (<! (timeout 10000))
+          (swap! db assoc :currently-analyzing nil)
+          (log/info (str "Analysis complete: " run-dir)))))
+  
   )
