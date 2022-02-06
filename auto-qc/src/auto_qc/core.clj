@@ -60,13 +60,13 @@
 
 (defn currently-analyzing?
   ""
-  [run-dir]
+  [run-dir db]
   (= (:currently-analyzing @db) run-dir))
 
 
 (defn scan-for-runs-to-analyze!
   ""
-  [run-dirs]
+  [run-dirs db]
   (doseq [run-dir run-dirs]
     (->> run-dir
          io/file
@@ -82,7 +82,7 @@
 (defn run-nextflow!
   "Run the BCCDC-PHL/routine-sequence-qc pipeline on a run directory.
    When the analysis completes, delete the 'work' directory."
-  [{:keys [run-dir revision]}]
+  [{:keys [run-dir revision]} db]
   (let [work-dir (str/join \/ [run-dir (str "work-" (java.util.UUID/randomUUID))])
         outdir (str/join \/ [run-dir "RoutineQC"])
         log-file (str/join \/ [outdir "nextflow.log"])]
@@ -105,7 +105,8 @@
                    "--outdir" "."]))
       (sh "rm" "-r" work-dir)
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
-      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+"))))
+      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
+      (swap! db assoc :currently-analyzing nil))))
 
 
 (defn -main
@@ -172,19 +173,38 @@
   ;; Exclude directories that don't match the illumina run directory naming scheme
   ;; Exclude those without 'upload_complete.json' file
   ;; Exclude those runs whose run ID is listed in an exclude file
-  ;; Add the remaining directories to the runs-to-analyze channel
+  ;; Exclude a run if it is currently being analyzed
+  ;; Take the first run from the list
+  ;; Put it on the runs-to-analyze channel
   ;; Park for 10 seconds
   ;; Recur
   (go-loop []
     (let [run-dirs (get-in @db [:config :run-dirs])]
-      (->> (scan-for-runs-to-analyze! run-dirs)
-           (filter #(not (currently-analyzing? %)))
+      (->> (scan-for-runs-to-analyze! run-dirs db)
+           (filter #(not (currently-analyzing? % db)))
            first
-           (>! runs-to-analyze-chan)))
+           (#(if (some? %)
+               (>! runs-to-analyze-chan)))))
     (<! (timeout 10000))
     (recur))
 
 
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;; Remove me
+  (defn mock-analyze!
+    ""
+    [{:keys [run-dir]} db]
+    (do
+      (swap! db assoc :currently-analyzing run-dir)
+      (log/info (str "Analysis started: " run-dir))
+      (go (<! (timeout 10000))
+          (swap! db assoc :currently-analyzing nil)
+          (log/info (str "Analysis complete: " run-dir)))))
+
+  ;;
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  
+  
   ;;
   ;; Main loop
   ;; Take directory path from runs-to-analyze channel
@@ -195,7 +215,7 @@
       (do
         (log/info (str "Analysis started: " run))
         (mock-analyze! {:run-dir run
-                        :revision "main"})
+                        :revision "main"} db)
         (log/info (str "Analysis complete: " run))))
     (recur (<!! runs-to-analyze-chan))))
 
@@ -222,12 +242,10 @@
   
   (defn mock-analyze!
     ""
-    [{:keys [run-dir]}]
+    [{:keys [run-dir]} db]
     (do
       (swap! db assoc :currently-analyzing run-dir)
-      (log/info (str "Analysis started: " run-dir))
       (go (<! (timeout 10000))
-          (swap! db assoc :currently-analyzing nil)
-          (log/info (str "Analysis complete: " run-dir)))))
+          (swap! db assoc :currently-analyzing nil))))
   
   )
