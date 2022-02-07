@@ -1,2 +1,3 @@
 {:run-dirs []
- :exclude-files []}
+ :exclude-files []
+ :repl false}

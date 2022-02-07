@@ -8,6 +8,7 @@
             [clojure.string :as str]
             [clojure.java.shell :as shell :refer [sh]]
             [clojure.core.async :as async :refer [go go-loop chan onto-chan! <! <!! >! >!! timeout]]
+            [nrepl.server :refer [start-server stop-server]]
             [auto-qc.cli :as cli])
   (:gen-class))
 
@@ -157,6 +158,14 @@
           (<! (timeout 60000))
           (recur)))))
 
+  ;;
+  ;; Start up REPL when configured to do so
+  (when (get-in @db [:config :repl])
+    (let [uuid (java.util.UUID/randomUUID)]
+      (do
+        (sh "mkdir" "-p" "/tmp/auto-qc")
+        (sh "chmod" "700" "/tmp/auto-qc")
+        (defonce server (start-server :socket (str "/tmp/auto-qc/auto-qc-" uuid ".sock"))))))
 
   ;;
   ;; Load list of excluded runs from all exclude files
