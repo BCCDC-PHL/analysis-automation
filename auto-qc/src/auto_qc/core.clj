@@ -26,6 +26,14 @@
       (printf "Error parsing edn file '%s': %s\n" source (.getMessage e)))))
 
 
+(defn update-config!
+  "Read config from file and insert into db under key :config"
+  [config-file-path db]
+  (if (.exists (io/file config-file-path))
+    (let [config (load-edn config-file-path)]
+      (swap! db (fn [x] (assoc x :config config))))))
+
+
 (defn matches-run-directory-regex?
   "Check that the directory name matches one of the standard illumina directory name formats."
   [run-dir]
@@ -50,14 +58,46 @@
     (.exists (io/file analysis-dir-path))))
 
 
+(defn currently-analyzing?
+  "Check if a run directory is currently being analyzed."
+  [run-dir db]
+  (= (:currently-analyzing @db) run-dir))
+
+
+(defn scan-directory-for-runs-to-analyze!
+  "Scan a single directory for run directories to analyze.
+   Run directories must match standard illumina naming scheme
+   and contain an 'upload_complete.json' file indicating that
+   they've  been completely uploaded to the server.
+   Excludes any directories that have already been analyzed,
+   or are included in excluded-run-ids."
+  [run-dir excluded-run-ids]
+  (->> run-dir
+       io/file
+       .listFiles
+       (map (memfn getCanonicalPath))
+       (filter #(.isDirectory (io/file %)))
+       (filter matches-run-directory-regex?)
+       (filter upload-complete?)
+       (filter #(not (analyzed? %)))
+       (filter #(not (contains? excluded-run-ids (.getName (io/file %)))))))
+
+
+(defn scan-for-runs-to-analyze!
+  "Scan through multiple run directories for runs to analyze"
+  [run-dirs excluded-run-ids]
+  (flatten (map #(scan-directory-for-runs-to-analyze! % excluded-run-ids) run-dirs)))
+
+
 (defn run-nextflow!
   "Run the BCCDC-PHL/routine-sequence-qc pipeline on a run directory.
    When the analysis completes, delete the 'work' directory."
-  [{:keys [run-dir revision]}]
+  [{:keys [run-dir revision]} db]
   (let [work-dir (str/join \/ [run-dir (str "work-" (java.util.UUID/randomUUID))])
         outdir (str/join \/ [run-dir "RoutineQC"])
         log-file (str/join \/ [outdir "nextflow.log"])]
     (do
+      (swap! db assoc :currently-analyzing run-dir)
       (sh "mkdir" "-p" outdir)
       (sh "chmod" "750" outdir)
       (sh "mkdir" "-p" work-dir)
@@ -75,7 +115,8 @@
                    "--outdir" "."]))
       (sh "rm" "-r" work-dir)
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
-      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+"))))
+      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
+      (swap! db assoc :currently-analyzing nil))))
 
 
 (defn -main
@@ -101,15 +142,7 @@
 
   ;;
   ;; In-memory db for co-ordinated state
-  (def db (atom {}))
-
-
-  (defn update-config!
-    "Read config from file and insert into db under key :config"
-    [config-file-path db]
-    (if (.exists (io/file config-file-path))
-      (let [config (load-edn config-file-path)]
-        (swap! db (fn [x] (assoc x :config config))))))
+  (defonce db (atom {}))
   
   ;;
   ;; Load config to db
@@ -123,7 +156,8 @@
           (log/debug (str "Current config: " (:config @db)))
           (<! (timeout 60000))
           (recur)))))
-  
+
+
   ;;
   ;; Load list of excluded runs from all exclude files
   ;; Store set of run IDs under :excluded-run-ids in db
@@ -150,22 +184,22 @@
   ;; Exclude directories that don't match the illumina run directory naming scheme
   ;; Exclude those without 'upload_complete.json' file
   ;; Exclude those runs whose run ID is listed in an exclude file
-  ;; Add the remaining directories to the runs-to-analyze channel
+  ;; Exclude a run if it is currently being analyzed
+  ;; Take the first run from the remaining list
+  ;; Put it on the runs-to-analyze channel
   ;; Park for 10 seconds
   ;; Recur
   (go-loop []
-    (let [run-dirs (get-in @db [:config :run-dirs])]
-      (doseq [run-dir run-dirs]
-        (->> run-dir
-             io/file
-             .listFiles
-             (map (memfn getCanonicalPath))
-             (filter #(.isDirectory (io/file %)))
-             (filter matches-run-directory-regex?)
-             (filter upload-complete?)
-             (filter #(not (analyzed? %)))
-             (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %)))))
-             (#(doseq [run %] (go (>! runs-to-analyze-chan run)))))))
+    (log/debug "Scanning for runs...")
+    (let [run-dirs (get-in @db [:config :run-dirs])
+          excluded-run-ids (get-in @db [:excluded-run-ids])]
+      (->> (scan-for-runs-to-analyze! run-dirs excluded-run-ids)
+           (filter #(not (currently-analyzing? % db)))
+           first
+           (#(when-some [run %]
+               (do
+                 (log/debug (str "Putting on channel:" run))
+                 (go (>! runs-to-analyze-chan run)))))))
     (<! (timeout 10000))
     (recur))
 
@@ -176,12 +210,9 @@
   ;; Run nextflow pipeline
   ;; Recur with the next directory path on the channel
   (loop [run (<!! runs-to-analyze-chan)]
-    (if (some? run)
-      (do
-        (log/info (str "Analysis started: " run))
-        (run-nextflow! {:run-dir run
-                        :revision "main"})
-        (log/info (str "Analysis complete: " run))))
+    (when-some [r run]
+      (run-nextflow! {:run-dir r
+                      :revision "main"} db))
     (recur (<!! runs-to-analyze-chan))))
 
 
@@ -191,13 +222,26 @@
   ;;
   ;; Useful forms for REPL-driven development
 
-  (def opts {:options {:config "config.edn"}})
+  (def opts {:options {:config "dev-config.edn"}})
+
+  ;; Reload config
+  (update-config! (get-in opts [:options :config]) db)
+
+  ;; Clear excluded run list
+  (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
+
+  ;; Reload excluded run list from exclude files
+  (doseq [exclude-file-path (get-in @db [:config :exclude-files])]
+    (if (.exists (io/file exclude-file-path))
+      (with-open [rdr (io/reader exclude-file-path)]
+        (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))
   
   (defn mock-analyze!
     ""
-    [{:keys [run-dir]}]
+    [{:keys [run-dir]} db]
     (do
-      (log/info (str "Analyzing: " run-dir))
-      (Thread/sleep 10000)
-      (log/info (str "Analysis complete: " run-dir))))
+      (swap! db assoc :currently-analyzing run-dir)
+      (go (<! (timeout 10000))
+          (swap! db assoc :currently-analyzing nil))))
+  
   )
