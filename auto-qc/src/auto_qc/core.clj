@@ -8,6 +8,7 @@
             [clojure.string :as str]
             [clojure.java.shell :as shell :refer [sh]]
             [clojure.core.async :as async :refer [go go-loop chan onto-chan! <! <!! >! >!! timeout]]
+            [nrepl.server :refer [start-server stop-server]]
             [auto-qc.cli :as cli])
   (:gen-class))
 
@@ -59,24 +60,34 @@
 
 
 (defn currently-analyzing?
-  ""
+  "Check if a run directory is currently being analyzed."
   [run-dir db]
   (= (:currently-analyzing @db) run-dir))
 
 
+(defn scan-directory-for-runs-to-analyze!
+  "Scan a single directory for run directories to analyze.
+   Run directories must match standard illumina naming scheme
+   and contain an 'upload_complete.json' file indicating that
+   they've  been completely uploaded to the server.
+   Excludes any directories that have already been analyzed,
+   or are included in excluded-run-ids."
+  [run-dir excluded-run-ids]
+  (->> run-dir
+       io/file
+       .listFiles
+       (map (memfn getCanonicalPath))
+       (filter #(.isDirectory (io/file %)))
+       (filter matches-run-directory-regex?)
+       (filter upload-complete?)
+       (filter #(not (analyzed? %)))
+       (filter #(not (contains? excluded-run-ids (.getName (io/file %)))))))
+
+
 (defn scan-for-runs-to-analyze!
-  ""
-  [run-dirs db]
-  (doseq [run-dir run-dirs]
-    (->> run-dir
-         io/file
-         .listFiles
-         (map (memfn getCanonicalPath))
-         (filter #(.isDirectory (io/file %)))
-         (filter matches-run-directory-regex?)
-         (filter upload-complete?)
-         (filter #(not (analyzed? %)))
-         (filter #(not (contains? (:excluded-run-ids @db) (.getName (io/file %))))))))
+  "Scan through multiple run directories for runs to analyze"
+  [run-dirs excluded-run-ids]
+  (flatten (map #(scan-directory-for-runs-to-analyze! % excluded-run-ids) run-dirs)))
 
 
 (defn run-nextflow!
@@ -146,7 +157,18 @@
           (log/debug (str "Current config: " (:config @db)))
           (<! (timeout 60000))
           (recur)))))
-  
+
+
+  ;;
+  ;; Start up REPL when configured to do so
+  (when (get-in @db [:config :repl])
+    (let [uuid (java.util.UUID/randomUUID)]
+      (do
+        (sh "mkdir" "-p" "/tmp/auto-qc")
+        (sh "chmod" "700" "/tmp/auto-qc")
+        (defonce server (start-server :socket (str "/tmp/auto-qc/auto-qc-" uuid ".sock"))))))
+
+
   ;;
   ;; Load list of excluded runs from all exclude files
   ;; Store set of run IDs under :excluded-run-ids in db
@@ -174,49 +196,34 @@
   ;; Exclude those without 'upload_complete.json' file
   ;; Exclude those runs whose run ID is listed in an exclude file
   ;; Exclude a run if it is currently being analyzed
-  ;; Take the first run from the list
+  ;; Take the first run from the remaining list
   ;; Put it on the runs-to-analyze channel
   ;; Park for 10 seconds
   ;; Recur
   (go-loop []
-    (let [run-dirs (get-in @db [:config :run-dirs])]
-      (->> (scan-for-runs-to-analyze! run-dirs db)
+    (log/debug "Scanning for runs...")
+    (let [run-dirs (get-in @db [:config :run-dirs])
+          excluded-run-ids (get-in @db [:excluded-run-ids])]
+      (->> (scan-for-runs-to-analyze! run-dirs excluded-run-ids)
            (filter #(not (currently-analyzing? % db)))
            first
-           (#(if (some? %)
-               (>! runs-to-analyze-chan)))))
+           (#(when-some [run %]
+               (do
+                 (log/debug (str "Putting on channel:" run))
+                 (go (>! runs-to-analyze-chan run)))))))
     (<! (timeout 10000))
     (recur))
 
 
-  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  ;; Remove me
-  (defn mock-analyze!
-    ""
-    [{:keys [run-dir]} db]
-    (do
-      (swap! db assoc :currently-analyzing run-dir)
-      (log/info (str "Analysis started: " run-dir))
-      (go (<! (timeout 10000))
-          (swap! db assoc :currently-analyzing nil)
-          (log/info (str "Analysis complete: " run-dir)))))
-
-  ;;
-  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-  
-  
   ;;
   ;; Main loop
   ;; Take directory path from runs-to-analyze channel
   ;; Run nextflow pipeline
   ;; Recur with the next directory path on the channel
   (loop [run (<!! runs-to-analyze-chan)]
-    (if (some? run)
-      (do
-        (log/info (str "Analysis started: " run))
-        (mock-analyze! {:run-dir run
-                        :revision "main"} db)
-        (log/info (str "Analysis complete: " run))))
+    (when-some [r run]
+      (run-nextflow! {:run-dir r
+                      :revision "main"} db))
     (recur (<!! runs-to-analyze-chan))))
 
 
