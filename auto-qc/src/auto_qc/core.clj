@@ -142,6 +142,8 @@
       (swap! db assoc :currently-analyzing nil))))
 
 
+
+
 (defn -main
   "Main entry point"
   [& args]
@@ -192,11 +194,9 @@
   ;;
   ;; Load list of excluded runs from all exclude files
   ;; Store set of run IDs under :excluded-run-ids in db
-  ;; Updates once synchronously, then asynchronously every 10 seconds
-  (update-excluded-runs! db)
+  ;; Updates asynchronously every 10 seconds
   (go-loop []
     (update-excluded-runs! db)
-    (log/debug (str "Excluded runs: " (:excluded-run-ids @db)))
     (<! (timeout 10000))
     (recur))
 
@@ -217,7 +217,9 @@
   (go-loop []
     (log/debug "Scanning for runs...")
     (let [run-dirs (get-in @db [:config :run-dirs])
+          _ (update-excluded-runs! db)
           excluded-run-ids (get-in @db [:excluded-run-ids])]
+      (log/debug (str "Excluded runs: " excluded-run-ids))
       (->> (scan-for-runs-to-analyze! run-dirs excluded-run-ids)
            (filter #(not (currently-analyzing? % db)))
            first
@@ -235,6 +237,7 @@
   ;; Run nextflow pipeline
   ;; Recur with the next directory path on the channel
   (loop [run (<!! runs-to-analyze-chan)]
+    (log/debug (str "Took from channel: " run))
     (when-some [r run]
       (run-nextflow! {:run-dir r
                       :revision "main"} db))
