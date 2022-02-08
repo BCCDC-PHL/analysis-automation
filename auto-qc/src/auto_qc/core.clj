@@ -78,18 +78,24 @@
   (= (:currently-analyzing @db) run-dir))
 
 
-(defn scan-directory-for-runs-to-analyze!
+(defn scan-directory!
+  "Scan a directory and return a list of all files in the directory"
+  [run-dir]
+  (->> run-dir
+       io/file
+       .listFiles
+       (map (memfn getCanonicalPath))))
+
+
+(defn filter-for-runs-to-analyze
   "Scan a single directory for run directories to analyze.
    Run directories must match standard illumina naming scheme
    and contain an 'upload_complete.json' file indicating that
    they've  been completely uploaded to the server.
    Excludes any directories that have already been analyzed,
    or are included in excluded-run-ids."
-  [run-dir excluded-run-ids]
-  (->> run-dir
-       io/file
-       .listFiles
-       (map (memfn getCanonicalPath))
+  [paths excluded-run-ids]
+  (->> paths
        (filter #(.isDirectory (io/file %)))
        (filter matches-run-directory-regex?)
        (filter upload-complete?)
@@ -100,7 +106,10 @@
 (defn scan-for-runs-to-analyze!
   "Scan through multiple run directories for runs to analyze"
   [run-dirs excluded-run-ids]
-  (flatten (map #(scan-directory-for-runs-to-analyze! % excluded-run-ids) run-dirs)))
+  (-> (map scan-directory! run-dirs)
+      flatten
+      (filter-for-runs-to-analyze excluded-run-ids)))
+      
 
 
 (defn run-nextflow!
