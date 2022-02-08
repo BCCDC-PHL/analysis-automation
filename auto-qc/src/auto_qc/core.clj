@@ -142,6 +142,34 @@
       (swap! db assoc :currently-analyzing nil))))
 
 
+(defn start-scanning!
+  "Spawn a background process to repeatedly scan directories for runs to analyze.
+   Scanning will stop if an item is put on the kill-chan."
+  [runs-to-analyze-chan kill-chan db]
+  (go-loop []
+    (log/debug "Scanning for runs...")
+    (let [run-dirs (get-in @db [:config :run-dirs])
+          _ (update-excluded-runs! db)
+          excluded-run-ids (get-in @db [:excluded-run-ids])]
+      (log/debug (str "Excluded runs: " excluded-run-ids))
+      (->> (scan-for-runs-to-analyze! run-dirs excluded-run-ids)
+           (filter #(not (currently-analyzing? % db)))
+           first
+           (#(when-some [run %]
+               (do
+                 (log/debug (str "Putting on channel: " run))
+                 (go (>! runs-to-analyze-chan run)))))))
+      
+    (let [[v p] (async/alts! [(timeout 10000) kill-chan])]
+      (if-not (= p kill-chan)
+        (recur)))))
+
+
+(defn stop-scanning!
+  "Stop the directory scanning process by putting a value on the kill-chan"
+  [kill-chan]
+  (async/put! kill-chan true))
+
 
 
 (defn -main
@@ -202,6 +230,7 @@
 
   
   (def runs-to-analyze-chan (chan))
+  (def kill-chan (chan))
 
   ;;
   ;; Scan through contents of run-dirs
@@ -214,21 +243,8 @@
   ;; Put it on the runs-to-analyze channel
   ;; Park for 10 seconds
   ;; Recur
-  (go-loop []
-    (log/debug "Scanning for runs...")
-    (let [run-dirs (get-in @db [:config :run-dirs])
-          _ (update-excluded-runs! db)
-          excluded-run-ids (get-in @db [:excluded-run-ids])]
-      (log/debug (str "Excluded runs: " excluded-run-ids))
-      (->> (scan-for-runs-to-analyze! run-dirs excluded-run-ids)
-           (filter #(not (currently-analyzing? % db)))
-           first
-           (#(when-some [run %]
-               (do
-                 (log/debug (str "Putting on channel: " run))
-                 (go (>! runs-to-analyze-chan run)))))))
-    (<! (timeout 10000))
-    (recur))
+  (start-scanning! runs-to-analyze-chan kill-chan db)
+  
 
 
   ;;
