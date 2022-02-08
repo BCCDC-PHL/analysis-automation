@@ -35,6 +35,19 @@
       (swap! db (fn [x] (assoc x :config config))))))
 
 
+(defn update-excluded-runs!
+  ""
+  [db]
+  (let [exclude-file-paths (get-in @db [:config :exclude-files])]
+    (when (some? exclude-file-paths)
+      (dosync
+       (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
+       (doseq [exclude-file-path exclude-file-paths]
+         (if (.exists (io/file exclude-file-path))
+           (with-open [rdr (io/reader exclude-file-path)]
+             (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))))))
+
+
 (defn matches-run-directory-regex?
   "Check that the directory name matches one of the standard illumina directory name formats."
   [run-dir]
@@ -170,19 +183,13 @@
   ;;
   ;; Load list of excluded runs from all exclude files
   ;; Store set of run IDs under :excluded-run-ids in db
-  ;; Refresh every 10 seconds
+  ;; Updates once synchronously, then asynchronously every 10 seconds
+  (update-excluded-runs! db)
   (go-loop []
-    (let [exclude-file-paths (get-in @db [:config :exclude-files])]
-      (when (some? exclude-file-paths)
-        (dosync
-         (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
-         (doseq [exclude-file-path exclude-file-paths]
-           (if (.exists (io/file exclude-file-path))
-             (with-open [rdr (io/reader exclude-file-path)]
-               (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))))
-      (log/debug (str "Excluded runs: " (:excluded-run-ids @db)))
-      (<! (timeout 10000))
-      (recur)))
+    (update-excluded-runs! db)
+    (log/debug (str "Excluded runs: " (:excluded-run-ids @db)))
+    (<! (timeout 10000))
+    (recur))
 
   
   (def runs-to-analyze-chan (chan))
@@ -207,7 +214,7 @@
            first
            (#(when-some [run %]
                (do
-                 (log/debug (str "Putting on channel:" run))
+                 (log/debug (str "Putting on channel: " run))
                  (go (>! runs-to-analyze-chan run)))))))
     (<! (timeout 10000))
     (recur))
@@ -235,6 +242,8 @@
 
   ;; Reload config
   (update-config! (get-in opts [:options :config]) db)
+
+  (update-excluded-runs! db)
 
   ;; Clear excluded run list
   (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
