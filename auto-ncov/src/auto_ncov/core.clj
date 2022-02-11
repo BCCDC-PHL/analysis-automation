@@ -24,8 +24,8 @@
       (swap! db assoc :currently-analyzing symlink-dir)
       (log/debug (str "Analysis started: " symlink-dir))
       (go (<! (timeout 10000))
-          (swap! db assoc :currently-analyzing nil))
-      (log/debug (str "Analysis complete: " symlink-dir))))
+          (log/debug (str "Analysis complete: " symlink-dir))
+          (swap! db assoc :currently-analyzing nil))))
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
@@ -144,11 +144,20 @@
 
 
 (defn scan-for-runs-to-symlink!
-  "Scan through multiple run directories for runs to analyze"
-  [run-dirs symlinks-dir excluded-run-ids]
-  (-> (map scan-directory! run-dirs)
-      flatten
-      (filter-for-runs-to-symlink symlinks-dir excluded-run-ids)))
+  "Scan through multiple run directories for runs to symlink.
+   takes:
+     `db`: Global app-state db (Atom)
+
+   returns:
+     Sequence of illumina run directory paths available for symlinking ([String])
+  "
+  [db]
+  (let [run-dirs              (get-in @db [:config :run-dirs])
+        symlinks-dir          (get-in @db [:config :symlinks-dir])
+        excluded-run-ids      (get @db :excluded-run-ids)]
+    (-> (map scan-directory! run-dirs)
+        flatten
+        (filter-for-runs-to-symlink symlinks-dir excluded-run-ids))))
 
 
 (defn filter-for-runs-to-analyze
@@ -156,11 +165,11 @@
    and contain an 'symlinks_complete.json' file indicating that
    fastq symlinks have been created.
    Excludes any directories that have already been analyzed,
-   or are included in excluded-run-ids.
+   or are included in `excluded-run-ids`.
 
    takes:
-     paths: sequence of fastq symlinks directories ([String])
-     db: global state database (Atom)
+     `paths`: sequence of fastq symlinks directory paths ([String])
+     `db`: global state database (Atom)
 
    returns:
      filtered sequence of fastq symlinks directories ([String])
@@ -262,7 +271,7 @@
         project-library-ids (get-project-library-ids-from-samplesheet! samplesheet-path project-id)
         symlinks-complete   {:destination_directory symlinks-dest-dir
                              :num_symlinks_created (count project-library-ids)
-                             :source_directory fastq-src-dir}]
+                             :source_directory run-dir}]
     (do
       (.mkdir (io/file symlinks-dest-dir))
       (doseq [library-id project-library-ids]
@@ -434,17 +443,12 @@
   ;; Recur
   (go-loop []
     (log/debug "Scanning for runs to symlink...")
-    (let [run-dirs (get-in @db [:config :run-dirs])
-          symlinks-dir (get-in @db [:config :symlinks-dir])
-          _ (update-excluded-runs! db)
-          excluded-run-ids (get-in @db [:excluded-run-ids])]
-      (log/debug (str "Excluded runs: " excluded-run-ids))
-      (->> (scan-for-runs-to-symlink! run-dirs symlinks-dir excluded-run-ids)
-           first
-           (#(when-some [run %]
-               (do
-                 (log/debug (str "Putting on symlink channel: " run))
-                 (go (>! runs-to-symlink-chan run)))))))
+    (->> (scan-for-runs-to-symlink! db)
+         first
+         (#(when-some [run %]
+             (do
+               (log/debug (str "Putting on symlink channel: " run))
+               (go (>! runs-to-symlink-chan run))))))
     (<! (timeout 10000))
     (recur))
 
