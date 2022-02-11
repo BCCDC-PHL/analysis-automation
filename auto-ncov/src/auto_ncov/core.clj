@@ -7,7 +7,7 @@
             [clojure.tools.cli :refer [parse-opts]]
             [clojure.string :as str]
             [clojure.java.shell :as shell :refer [sh]]
-            [clojure.core.async :as async :refer [go go-loop chan onto-chan! <! <!! >! >!! timeout]]
+            [clojure.core.async :as async :refer [go go-loop chan onto-chan! put! take! <! <!! >! >!! timeout]]
             [clojure.data.json :as json]
             [nrepl.server :refer [start-server stop-server]]
             [auto-ncov.cli :as cli]
@@ -18,14 +18,14 @@
 ;;
 ;; Remove me
 (defn mock-analyze!
-    ""
-    [symlink-dir db]
-    (do
-      (swap! db assoc :currently-analyzing symlink-dir)
-      (log/debug (str "Analysis started: " symlink-dir))
-      (go (<! (timeout 10000))
-          (log/debug (str "Analysis complete: " symlink-dir))
-          (swap! db assoc :currently-analyzing nil))))
+  ""
+  [symlink-dir db]
+  (do
+    (swap! db assoc :currently-analyzing symlink-dir)
+    (log/debug (str "Analysis started: " symlink-dir))
+    (go (<! (timeout 10000))
+        (log/debug (str "Analysis complete: " symlink-dir))
+        (swap! db assoc :currently-analyzing nil))))
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 
@@ -187,9 +187,10 @@
 
 (defn scan-for-runs-to-analyze!
   "Scan through symlinks directory for runs to analyze"
-  [symlinks-dir db]
-  (-> (scan-directory! symlinks-dir)
-      (filter-for-runs-to-analyze db))) 
+  [db]
+  (let [symlinks-dir (get-in @db [:config :symlinks-dir])]
+    (-> (scan-directory! symlinks-dir)
+        (filter-for-runs-to-analyze db))))
 
 
 (defn find-samplesheet!
@@ -288,6 +289,67 @@
       (log/debug (str "Symlinks complete: " symlinks-dest-dir)))))
 
 
+(defn start-scanning-for-runs-to-symlink!
+  ""
+  [runs-to-symlink-chan kill-chan db]
+  (go-loop []
+    (do
+      (log/debug "Scanning for runs to symlink...")
+      (let [run (first (scan-for-runs-to-symlink! db))]
+        (when-some [r run]
+          (do
+            (log/debug "Found directory to symlink: " run)
+            (>! runs-to-symlink-chan r))))
+      (let [[v ch] (async/alts! [(timeout 10000) kill-chan])]
+        (if (= ch kill-chan)
+          (log/debug "Stopped scanning for runs to symlink.")
+          (recur))))))
+
+
+
+
+(defn start-symlinker!
+  ""
+  [runs-to-symlink-chan db]
+  ;;
+  ;; Take directory path from runs-to-symlink channel
+  ;; Create symlinks
+  ;; Recur with the next directory path on the channel
+  (go-loop [run (<! runs-to-symlink-chan)]
+    (log/debug (str "Took from symlink channel: " run))
+    (when-some [r run]
+      (let [symlinks-dir (get-in @db [:config :symlinks-dir])
+            project-id (get-in @db [:config :samplesheet-project-id])]
+        (symlink! run symlinks-dir project-id)))
+    (recur (<! runs-to-symlink-chan))))
+
+
+(defn start-scanning-for-runs-to-analyze!
+  ""
+  [runs-to-analyze-chan kill-chan db]
+  (go-loop []
+    (do
+      (log/debug "Scanning for runs to analyze...")
+      (let [run (first (scan-for-runs-to-analyze! db))]
+        (when-some [r run]
+          (do
+            (log/debug "Found directory to analyze: " run)
+            (>! runs-to-analyze-chan r))))
+      (let [[v ch] (async/alts! [(timeout 10000) kill-chan])]
+        (if (= ch kill-chan)
+          (log/debug "Stopped scanning for runs to analyze.")
+          (recur))))))
+
+
+
+
+
+(defn put-stop!
+  "Stop the process by putting a value on the kill-chan"
+  [kill-chan]
+  (put! kill-chan :stop))
+
+
 (defn run-ncov2019-artic-nf!
   "Run the BCCDC-PHL/ncov2019-artic-nf pipeline on a run directory.
    When the analysis completes, delete the 'work' directory."
@@ -368,6 +430,16 @@
   (mock-analyze! run db))
 
 
+(defn start-analyzer!
+  ""
+  [runs-to-analyze-chan db]
+  (go-loop [run (<! runs-to-analyze-chan)]
+    (log/debug (str "Took from analysis channel: " run))
+    (when-some [r run]
+      (analyze! run db))
+    (recur (<! runs-to-analyze-chan))))
+
+
 (defn -main
   "Main entry point"
   [& args]
@@ -426,45 +498,13 @@
     (recur))
 
   
-  (def runs-to-symlink-chan (chan))
+  (defonce runs-to-symlink-chan (chan))
+  (defonce kill-symlinking-chan (chan))
 
-  (def runs-to-analyze-chan (chan))
+  (defonce runs-to-analyze-chan (chan))
+  (defonce kill-analysis-chan (chan))
 
-  ;;
-  ;; Scan through contents of run-dirs
-  ;; Include only directories (not files)
-  ;; Exclude directories that don't match the illumina run directory naming scheme
-  ;; Exclude those without 'upload_complete.json' file
-  ;; Exclude those runs whose run ID is listed in an exclude file
-  ;; Exclude a run if it is currently being analyzed
-  ;; Take the first run from the remaining list
-  ;; Put it on the runs-to-analyze channel
-  ;; Park for 10 seconds
-  ;; Recur
-  (go-loop []
-    (log/debug "Scanning for runs to symlink...")
-    (->> (scan-for-runs-to-symlink! db)
-         first
-         (#(when-some [run %]
-             (do
-               (log/debug (str "Putting on symlink channel: " run))
-               (go (>! runs-to-symlink-chan run))))))
-    (<! (timeout 10000))
-    (recur))
-
-
-  ;;
-  ;; Take directory path from runs-to-symlink channel
-  ;; Create symlinks
-  ;; Recur with the next directory path on the channel
-  (go-loop [run (<! runs-to-symlink-chan)]
-    (log/debug (str "Took from symlink channel: " run))
-    (when-some [r run]
-      (let [symlinks-dir (get-in @db [:config :symlinks-dir])
-            project-id (get-in @db [:config :samplesheet-project-id])]
-        (symlink! run symlinks-dir project-id)))
-    (recur (<! runs-to-symlink-chan)))
-
+  (start-symlinker! runs-to-symlink-chan db)
 
   ;;
   ;; Scan through contents of run-dirs
@@ -477,33 +517,21 @@
   ;; Put it on the runs-to-analyze channel
   ;; Park for 10 seconds
   ;; Recur
-  (go-loop []
-    (log/debug "Scanning for runs to analyze...")
-    (let [run-dirs (get-in @db [:config :run-dirs])
-          symlinks-dir (get-in @db [:config :symlinks-dir])
-          _ (update-excluded-runs! db)
-          excluded-run-ids (get-in @db [:excluded-run-ids])]
-      (log/debug (str "Excluded runs: " excluded-run-ids))
-      (->> (scan-for-runs-to-analyze! symlinks-dir db)
-           (filter #(not= (get @db :currently-analyzing) %)) 
-           first
-           (#(when-some [run %]
-               (do
-                 (log/debug (str "Putting on analysis channel: " run))
-                 (go (>! runs-to-analyze-chan run)))))))
-    (<! (timeout 10000))
-    (recur))
+  (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
 
-
+  (start-analyzer! runs-to-analyze-chan db)
   ;;
-  ;; Take directory path from runs-to-analyze channel
-  ;; Analyze runs
-  ;; Recur with the next directory path on the channel
-  (go-loop [run (<! runs-to-analyze-chan)]
-    (log/debug (str "Took from analysis channel: " run))
-    (when-some [r run]
-        (analyze! run db))
-    (recur (<! runs-to-analyze-chan)))
+  ;; Scan through contents of run-dirs
+  ;; Include only directories (not files)
+  ;; Exclude directories that don't match the illumina run directory naming scheme
+  ;; Exclude those without 'upload_complete.json' file
+  ;; Exclude those runs whose run ID is listed in an exclude file
+  ;; Exclude a run if it is currently being analyzed
+  ;; Take the first run from the remaining list
+  ;; Put it on the runs-to-analyze channel
+  ;; Park for 10 seconds
+  ;; Recur
+  (start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
 
   ;;
   ;; Main loop
