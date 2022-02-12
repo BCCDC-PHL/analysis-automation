@@ -610,14 +610,30 @@
 
 
 (defn analyze!
-  ""
+  "Run the two nextflow analysis pipelines on `run`.
+
+   takes:
+     `run`: Path to fastq symlinks dir to be analyzed. (`String`)
+     `db`: Global app-state db. (`Atom`)
+
+   returns:
+    `nil`
+  "
   [run db]
   (-> (run-ncov2019-artic-nf! run db)
       (run-ncov-tools-nf! db)))
 
 
 (defn start-analyzer!
-  ""
+  "Starts the (asynchronous) process of analyzing any directories put on `runs-to-analyze-chan`.
+
+   takes:
+     `runs-to-analyse-chan`: Channel to take run directories from for analysis (`Channel`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     (`Channel`)
+  "
   [runs-to-analyze-chan db]
   (go-loop [run (<! runs-to-analyze-chan)]
     (log/debug (str "Took from analysis channel: " run))
@@ -719,8 +735,8 @@
   (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
   
   (defn mock-analyze!
-    ""
-    [{:keys [run-dir]} db]
+    "Mock analysis by sleeping for 10s"
+    [run-dir db]
     (do
       (swap! db assoc :currently-analyzing run-dir)
       (go (<! (timeout 10000))
