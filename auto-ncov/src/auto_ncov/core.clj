@@ -12,26 +12,33 @@
             [nrepl.server :refer [start-server stop-server]]
             [auto-ncov.cli :as cli]
             [auto-ncov.samplesheet :as samplesheet])
+  (:import [java.time.format DateTimeFormatter]
+           [java.time ZonedDateTime])
   (:gen-class))
 
 
-;;
-;; Remove me
-(defn mock-analyze!
-  ""
-  [symlink-dir db]
-  (do
-    (swap! db assoc :currently-analyzing symlink-dir)
-    (log/debug (str "Analysis started: " symlink-dir))
-    (go (<! (timeout 10000))
-        (log/debug (str "Analysis complete: " symlink-dir))
-        (swap! db assoc :currently-analyzing nil))))
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defn now!
+  "Generate an ISO-8601 timestamp (`YYYY-MM-DDTHH:mm:ss.xxxx-OFFSET`).
+   eg: `2022-02-11T14:13:49.9335-08:00`
+  
+   takes:
+   returns:
+     ISO-8601 timestamp for the current time (`String`)
+  "
+  []
+  (.. (ZonedDateTime/now) (format DateTimeFormatter/ISO_OFFSET_DATE_TIME)))
 
 
 (defn load-edn!
   "Load edn from an io/reader source (filename or io/resource).
-   https://clojuredocs.org/clojure.edn/read#example-5a68f384e4b09621d9f53a79"
+   https://clojuredocs.org/clojure.edn/read#example-5a68f384e4b09621d9f53a79
+
+   takes:
+     `source`: Path to edn file to load (`String`)
+
+   returns:
+     Data structure as determined by `source`.
+  "
   [source]
   (try
     (with-open [r (io/reader source)]
@@ -44,7 +51,15 @@
 
 
 (defn update-config!
-  "Read config from file and insert into db under key :config"
+  "Read config from file and insert into `db` under key `:config`.
+
+   takes:
+     `config-file-path`: Path to config file (`String`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     `nil`
+  "
   [config-file-path db]
   (if (.exists (io/file config-file-path))
     (let [config (load-edn! config-file-path)]
@@ -52,7 +67,15 @@
 
 
 (defn update-excluded-runs!
-  ""
+  "Update `db` by loading excluded run IDs from files and inserting under
+   key `:excluded-run-ids`.
+
+   takes:
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     `nil`
+  "
   [db]
   (let [exclude-file-paths (get-in @db [:config :exclude-files])]
     (when (some? exclude-file-paths)
@@ -65,9 +88,16 @@
 
 
 (defn matches-run-directory-regex?
-  "Check that the directory name matches one of the standard illumina directory name formats."
-  [run-dir]
-  (->> run-dir
+  "Check that the directory name matches one of the standard illumina directory name formats.
+
+   takes:
+     `dir`: Path to directory to be checked. (`String`)
+
+   returns:
+     `Boolean`
+  "
+  [dir]
+  (->> dir
        io/file
        .getName
        (re-matches #"\d{6}_[A-Z0-9]+_\d+_[A-Z0-9\-]+")
@@ -75,22 +105,44 @@
 
 
 (defn upload-complete?
-  "Check for presence of upload_complete.json file. Returns true if present, false otherwise"
+  "Check for presence of upload_complete.json file.
+
+   takes:
+     `run-dir`: Illumina sequencer output directory. (`String`)
+
+   returns:
+     `Boolean`
+  "
   [run-dir]
-  (let [upload-complete-path (str/join \/ [run-dir "upload_complete.json"])]
-    (.exists (io/file upload-complete-path))))
+  (let [upload-complete-path (io/file run-dir "upload_complete.json")]
+    (.exists upload-complete-path)))
 
 
 (defn symlink-dir-exists?
-  ""
+  "Check if the corresponding symlinks dir for `run-dir` exists.
+
+   takes:
+     `run-dir`: Path to illumina sequencer output dir. (`String`)
+     `symlinks-dir`: Path to top-level fastq symlinks dir. (`String`)
+
+   returns:
+     `Boolean`
+  "
   [run-dir symlinks-dir]
   (let [run-id (.getName (io/file run-dir))
-        symlinks-dir-path (str/join \/ [symlinks-dir run-id])]
-    (.exists (io/file symlinks-dir-path))))
+        symlinks-dir (io/file symlinks-dir run-id)]
+    (.exists symlinks-dir)))
 
 
 (defn symlinks-complete?
-  "Given a run "
+  "Check if symlinking is complete, based on the presence of a `symlinks_complete.json` file.
+  
+   takes:
+     `symlinks-dir`: Path to fastq symlinks dir. (`String`)
+
+   returns:
+     `Boolean`
+  "
   [symlinks-dir]
   (let [symlinks-complete-file (io/file symlinks-dir "symlinks_complete.json")]
     (.exists symlinks-complete-file)))
@@ -101,11 +153,11 @@
    analysis output directory exists.
 
    takes:
-     symlinks-dir: path (String)
-     analysis-output-dir path (String)
+     symlinks-dir: path (`String`)
+     analysis-output-dir path (`String`)
 
    returns:
-     boolean
+     `Boolean`
   "
   [symlinks-dir analysis-output-dir]
   (let [run-id (.getName (io/file symlinks-dir))
@@ -120,7 +172,14 @@
 
 
 (defn scan-directory!
-  "Scan a directory and return a list of all files in the directory"
+  "Scan a directory and return a list of all files in the directory.
+
+   takes:
+     `dir`: Path to directory to scan (`String`)
+
+   returns:
+     Sequence of (absolute) paths to contents of `dir`. (`[String]`)
+  "
   [dir]
   (->> dir
        io/file
@@ -133,7 +192,16 @@
    and contain an 'upload_complete.json' file indicating that
    they've  been completely uploaded to the server.
    Excludes any directories that have already been analyzed,
-   or are included in excluded-run-ids."
+   or are included in excluded-run-ids.
+
+   takes:
+     `paths`: Sequence of paths to illumina sequencer output dirs. (`[String]`)
+     `symlinks-dir`: Top-level fastq symlinks dir. (`String`)
+     `excluded-run-ids`: Set of run IDs to exclude from symlinking (`#{String}`)
+
+   returns:
+     Filtered sequence of paths to illumina sequencer output dirs. (`[String]`)
+  "
   [paths symlinks-dir excluded-run-ids]
   (->> paths
        (filter #(.isDirectory (io/file %)))
@@ -145,6 +213,7 @@
 
 (defn scan-for-runs-to-symlink!
   "Scan through multiple run directories for runs to symlink.
+
    takes:
      `db`: Global app-state db (Atom)
 
@@ -186,7 +255,14 @@
 
 
 (defn scan-for-runs-to-analyze!
-  "Scan through symlinks directory for runs to analyze"
+  "Scan through symlinks directory for runs to analyze.
+
+   takes:
+     `db`: Global app-state db (Atom)
+
+   returns:
+     Sequence of fastq symlinks directories ([String])
+  "
   [db]
   (let [symlinks-dir (get-in @db [:config :symlinks-dir])]
     (-> (scan-directory! symlinks-dir)
@@ -194,7 +270,14 @@
 
 
 (defn find-samplesheet!
-  ""
+  "Find the SampleSheet file within an illumina sequencer output directory.
+
+   takes:
+     `run-dir`: Path to illumina sequencer output directory (String)
+
+   returns:
+     Path to SampleSheet file. (String)
+  "
   [run-dir]
   (->> (io/file run-dir)
       .listFiles
@@ -204,7 +287,14 @@
 
 
 (defn determine-sequencer-type
-  ""
+  "Determine the type of sequencer, based on the run ID.
+
+   takes:
+     `run-id`: The run ID (`String`)
+
+   returns:
+     The sequencer type, one of: `:miseq`, `:nextseq`, or `:unknown`. (`Keyword`)  
+  "
   [run-id]
   (cond
     (re-matches #"\d{6}_M[0-9]{5}_\d{4}_[0]{9}-[A-Z0-9]{5}" run-id) :miseq
@@ -213,7 +303,15 @@
 
 
 (defn get-project-library-ids-from-samplesheet!
-  ""
+  "Get a list of library IDs for libraries belonging to this project in the SampleSheet.
+
+   takes:
+     `samplesheet-path`: Path to SampleSheet file (`String`)
+     `project-id`: Project ID used to identify samples for this project in the SampleSheet (`String`)
+
+   returns:
+     Sequence of library IDs. (`[String]`)
+  "
   [samplesheet-path project-id]
   (let [run-id (.getName (.getParentFile (io/file samplesheet-path)))
         samplesheet-lines (with-open [rdr (io/reader samplesheet-path)]
@@ -228,11 +326,21 @@
 
 (defn find-fastq-directory!
   "Given a run directory, find the directory containing fastq files.
-   MiSeqs store fastq files under Data/Intensities/BaseCalls.
-   NextSeqs store fastq files under Analysis/N/Data/fastq, where N is
+   MiSeqs store fastq files under `Data/Intensities/BaseCalls`.
+   NextSeqs store fastq files under `Analysis/N/Data/fastq`, where `N` is
    the number of times that demultiplexing has been performed.
-   In most cases, N is 1, but in cases where we have repeated demultiplexing,
-   we want to take the fastq files from the most recent (highest numbered) Analysis directory."
+   In most cases, `N` is 1, but in cases where we have repeated demultiplexing,
+   we want to take the fastq files from the most recent (highest numbered) Analysis directory.
+
+   takes:
+     `run-dir`: Path to an illumina sequencer output directory. (`String`)
+
+   returns:
+      Path to fastq directory within `run-dir`. (`String`)
+
+   throws:
+     `Exception`: If sequencer type is not `:miseq` or `:nextseq`, cannot determine fastq directory.
+  "
   [run-dir]
   (let [sequencer-type (determine-sequencer-type (.getName (io/file run-dir)))]
     (cond (= sequencer-type :miseq) (.getCanonicalPath (io/file run-dir "Data" "Intensities" "BaseCalls"))
@@ -245,8 +353,16 @@
 
 
 (defn symlink-one!
-  "Create one symlink from src to dest. Ignores exceptions
-   thrown when dest already exists."
+  "Create one symlink from `src` to `dest`. Ignores exceptions
+   thrown when dest already exists.
+
+   takes:
+     `src`: Path to source file. (`String`)
+     `dest`: Path to symlink destination. (`String`)
+
+   returns:
+     `nil`
+  "
   [src dest]
   (let [src-path (java.nio.file.Paths/get src (into-array String []))
         dest-path (java.nio.file.Paths/get dest (into-array String []))]
@@ -260,7 +376,16 @@
 
 
 (defn symlink!
-  "Create symlinks from run-dir to symlinks-dir, for samples belonging to project-id."
+  "Create symlinks from run-dir to `symlinks-dir`, for samples belonging to `project-id`.
+
+   takes:
+     `run-dir`: Path to illumina sequencer output directory to create symlinks for. (`String`) 
+     `symlinks-dir`: Path to top-level fastq symlinks directory for the project. (`String`)
+     `project-id`: Identifier used to mark libraries as belonging to this project in the SampleSheet file. (`String`)
+
+   returns:
+     `nil`
+  "
   [run-dir symlinks-dir project-id]
   (let [run-id              (.getName (io/file run-dir))
         fastq-src-dir       (find-fastq-directory! run-dir)
@@ -285,12 +410,21 @@
           (symlink-one! src-r1 dest-r1)
           (symlink-one! src-r2 dest-r2)))
       (spit (str (io/file symlinks-dest-dir "symlinks_complete.json"))
-            (with-out-str (json/pprint symlinks-complete :escape-slash false)))
-      (log/debug (str "Symlinks complete: " symlinks-dest-dir)))))
+            (with-out-str (json/pprint (assoc symlinks-complete :timestamp (now!)) :escape-slash false)))
+      (log/info (str "Symlinks complete: " symlinks-dest-dir)))))
 
 
 (defn start-scanning-for-runs-to-symlink!
-  ""
+  "Starts the (asynchronous) process of scanning for runs to symlink.
+
+   takes:
+     `runs-to-symlink-chan`: Channel to put run directories on for symlinking. (`Channel`)
+     `kill-chan`: Channel for killing the scanning process. (`Channel`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     (`Channel`)
+  "
   [runs-to-symlink-chan kill-chan db]
   (go-loop []
     (do
@@ -298,34 +432,46 @@
       (let [run (first (scan-for-runs-to-symlink! db))]
         (when-some [r run]
           (do
-            (log/debug "Found directory to symlink: " run)
+            (log/info "Found directory to symlink: " run)
             (>! runs-to-symlink-chan r))))
-      (let [[v ch] (async/alts! [(timeout 10000) kill-chan])]
+      (let [symlinks-scanning-interval (get-in @db [:config :symlinks-scanning-interval-ms] 10000)
+            [v ch] (async/alts! [(timeout symlinks-scanning-interval) kill-chan])]
         (if (= ch kill-chan)
-          (log/debug "Stopped scanning for runs to symlink.")
+          (log/info "Stopped scanning for runs to symlink.")
           (recur))))))
 
 
-
-
 (defn start-symlinker!
-  ""
+  "Starts the (asynchronous) process of symlinking any directories put on `runs-to-symlink-chan`.
+
+   takes:
+     `runs-to-symlink-chan`: Channel to take run directories from for symlinking (`Channel`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     (`Channel`)
+  "
   [runs-to-symlink-chan db]
-  ;;
-  ;; Take directory path from runs-to-symlink channel
-  ;; Create symlinks
-  ;; Recur with the next directory path on the channel
   (go-loop [run (<! runs-to-symlink-chan)]
     (log/debug (str "Took from symlink channel: " run))
     (when-some [r run]
       (let [symlinks-dir (get-in @db [:config :symlinks-dir])
-            project-id (get-in @db [:config :samplesheet-project-id])]
+            project-id   (get-in @db [:config :samplesheet-project-id])]
         (symlink! run symlinks-dir project-id)))
     (recur (<! runs-to-symlink-chan))))
 
 
 (defn start-scanning-for-runs-to-analyze!
-  ""
+  "Starts the (asynchronous) process of scanning for runs to analyze.
+
+   takes:
+     `runs-to-analyze-chan`: Channel to put fastq symlink directories on for analysis. (`Channel`)
+     `kill-chan`: Channel for killing the scanning process. (`Channel`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     (`Channel`)
+  "
   [runs-to-analyze-chan kill-chan db]
   (go-loop []
     (do
@@ -333,53 +479,71 @@
       (let [run (first (scan-for-runs-to-analyze! db))]
         (when-some [r run]
           (do
-            (log/debug "Found directory to analyze: " run)
+            (log/info "Found directory to analyze: " run)
             (>! runs-to-analyze-chan r))))
-      (let [[v ch] (async/alts! [(timeout 10000) kill-chan])]
+      (let [analysis-scanning-interval (get-in @db [:config :analysis-scanning-interval-ms] 10000)
+            [v ch] (async/alts! [(timeout analysis-scanning-interval) kill-chan])]
         (if (= ch kill-chan)
-          (log/debug "Stopped scanning for runs to analyze.")
+          (log/info "Stopped scanning for runs to analyze.")
           (recur))))))
 
 
-
-
-
 (defn put-stop!
-  "Stop the process by putting a value on the kill-chan"
+  "Stop a process by putting a value on the `kill-chan`.
+
+   takes:
+     `kill-chan`: Channel to put a value on to kill an async process. (`Channel`)
+
+   returns:
+     `boolean`
+  "
   [kill-chan]
   (put! kill-chan :stop))
 
 
 (defn run-ncov2019-artic-nf!
   "Run the BCCDC-PHL/ncov2019-artic-nf pipeline on a run directory.
-   When the analysis completes, delete the 'work' directory."
-  [db]
-  (let [symlinks-dir        (get-in @db [:config :symlinks-dir])
-        analysis-output-dir (get-in @db [:config :analysis-output-dir])
-        pipeline-version    (get-in @db [:config :ncov2019-artic-nf-config :version])
-        run-id              (.getName (io/file symlinks-dir))
-        work-dir            (str (io/file analysis-output-dir run-id (str "work-" (java.util.UUID/randomUUID))))
-        outdir              (str (io/file analysis-output-dir run-id (str "ncov2019-artic-nf-" pipeline-version "-output")))
-        log-file            (str (io/file outdir "nextflow.log"))
-        ref                 (get-in @db [:config :ncov2019-artic-nf-config :ref])
-        bed                 (get-in @db [:config :ncov2019-artic-nf-config :bed])
-        primer-pairs-tsv    (get-in @db [:config :ncov2019-artic-nf-config :primer-pairs-tsv])
-        gff                 (get-in @db [:config :ncov2019-artic-nf-config :gff])
-        composite-ref       (get-in @db [:config :ncov2019-artic-nf-config :composite-ref])]
+   When the analysis completes, delete the 'work' directory.
+
+   takes:
+     `symlinks-dir`: Path to symlinks directory to analyze. (`String`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     Path to analysis output directory. (`String`)
+  "
+  [symlinks-dir db]
+  (let [analysis-output-dir    (get-in @db [:config :analysis-output-dir])
+        pipeline-full-name     "BCCDC-PHL/ncov2019-artic-nf"
+        pipeline-short-name    (second (str/split pipeline-full-name #"/"))
+        pipeline-full-version  (get-in @db [:config :ncov2019-artic-nf-config :version])
+        pipeline-minor-version (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
+        run-id                 (.getName (io/file symlinks-dir))
+        work-dir               (str (io/file analysis-output-dir run-id (str "work-" pipeline-short-name "-" (java.util.UUID/randomUUID))))
+        outdir                 (str (io/file analysis-output-dir run-id (str pipeline-short-name "-" pipeline-minor-version "-output")))
+        log-file               (str (io/file outdir "nextflow.log"))
+        ref                    (get-in @db [:config :ncov2019-artic-nf-config :ref])
+        bed                    (get-in @db [:config :ncov2019-artic-nf-config :bed])
+        primer-pairs-tsv       (get-in @db [:config :ncov2019-artic-nf-config :primer-pairs-tsv])
+        gff                    (get-in @db [:config :ncov2019-artic-nf-config :gff])
+        composite-ref          (get-in @db [:config :ncov2019-artic-nf-config :composite-ref])]
     (do
       (swap! db assoc :currently-analyzing run-id)
+      (log/info (str "Started " pipeline-short-name " analysis: " symlinks-dir))
       (sh "mkdir" "-p" outdir)
       (sh "chmod" "750" outdir)
       (sh "mkdir" "-p" work-dir)
       (sh "chmod" "750" work-dir)
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
-                   "-q"
                    "-log" log-file
-                   "run" "BCCDC-PHL/ncov2019-artic-nf"
+                   "run" pipeline-full-name
                    "-profile" "conda"
                    "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
-                   "-r" pipeline-version
+                   "-r" pipeline-full-version
+                   "--illumina"
+                   "--directory" symlinks-dir
+                   "--prefix" run-id
                    "--ref" ref
                    "--bed" bed
                    "--primer_pairs_tsv" primer-pairs-tsv
@@ -387,47 +551,69 @@
                    "--composite_ref" composite-ref
                    "-work-dir" work-dir
                    "--outdir" "."]))
-      (sh "rm" "-r" work-dir)
+      
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
-      (swap! db assoc :currently-analyzing nil))))
+      (log/info (str "Finished " pipeline-short-name " analysis: " symlinks-dir))
+      (go (sh "rm" "-r" work-dir)))
+    outdir))
 
 
 (defn run-ncov-tools-nf!
-  "Run the BCCDC-PHL/ncov-tools-nf pipeline on a run directory.
-   When the analysis completes, delete the 'work' directory."
-  [{:keys [artic-analysis-dir revision]} db]
-  (let [run-id (.getName (.getParentFile (io/file artic-analysis-dir)))
-        work-dir (str/join \/ [artic-analysis-dir (str "work-" (java.util.UUID/randomUUID))])
-        outdir (str/join \/ [artic-analysis-dir (str "ncov-tools-" revision "-output")])
-        log-file (str/join \/ [outdir "nextflow.log"])]
+  "Run the BCCDC-PHL/ncov-tools-nf pipeline on an artic analysis directory.
+   When the analysis completes, delete the 'work' directory.
+
+   takes:
+     `artic-analysis-dir`: Path to artic analysis output directory. (`String`)
+     `db`: Global app-state db (`Atom`)
+   returns:
+     `nil`
+  "
+  [artic-analysis-dir db]
+  (let [run-id                  (.getName (.getParentFile (io/file artic-analysis-dir)))
+        pipeline-full-name      "BCCDC-PHL/ncov-tools-nf"
+        pipeline-short-name     (second (str/split pipeline-full-name #"/"))
+        pipeline-full-version   (get-in @db [:config :ncov-tools-nf-config :version])
+        pipeline-minor-version  (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
+        ncov-watchlists-version (get-in @db [:config :ncov-tools-nf-config :ncov-watchlists-version])
+        work-dir                (str (io/file (.getParentFile (io/file artic-analysis-dir)) (str "work-" pipeline-short-name "-" (java.util.UUID/randomUUID))))
+        outdir                  (str (io/file artic-analysis-dir (str "ncov-tools-" pipeline-minor-version "-output")))
+        log-file                (str (io/file outdir "nextflow.log"))]
     (do
-      (swap! db assoc-in [:currently-analyzing :ncov-tools-nf] run-id)
+      (log/info (str "Started " pipeline-short-name " analysis: " artic-analysis-dir))
       (sh "mkdir" "-p" outdir)
       (sh "chmod" "750" outdir)
       (sh "mkdir" "-p" work-dir)
       (sh "chmod" "750" work-dir)
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
-                   "-q"
                    "-log" log-file
-                   "run" "BCCDC-PHL/ncov-tools-nf"
+                   "run" pipeline-full-name
                    "-profile" "conda"
-                   "--cache" (str/join \/ [(System/getProperty "user.home") ".conda/envs"])
-                   "-r" revision
-                   ;; ...TODO...
+                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+                   "-r" pipeline-full-version
+                   "--artic_analysis_dir" artic-analysis-dir
+                   "--ncov_watchlists_version" ncov-watchlists-version
+                   "--run_name" run-id
+                   "--downsampled"
+                   "--split_by_plate"
+                   "--freebayes_consensus"
+                   "--freebayes_variants"
                    "-work-dir" work-dir
                    "--outdir" "."]))
-      (sh "rm" "-r" work-dir)
+
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
-      (swap! db assoc-in [:currently-analyzing :ncov-tools-nf nil]))))
+      (swap! db assoc :currently-analyzing nil)
+      (log/info (str "Finished " pipeline-short-name " analysis: " artic-analysis-dir))
+      (go (sh "rm" "-r" work-dir)))))
 
 
 (defn analyze!
   ""
   [run db]
-  (mock-analyze! run db))
+  (-> (run-ncov2019-artic-nf! run db)
+      (run-ncov-tools-nf! db)))
 
 
 (defn start-analyzer!
@@ -473,10 +659,11 @@
       (do
         (update-config! config-file-path db)
         (go-loop []
-          (update-config! config-file-path db)
-          (log/debug (str "Current config: " (:config @db)))
-          (<! (timeout 60000))
-          (recur)))))
+          (let [config-reload-interval (get-in opts [:config :config-reload-interval-ms] 60000)]
+            (update-config! config-file-path db)
+            (log/debug (str "Current config: " (:config @db)))
+            (<! (timeout config-reload-interval))
+            (recur))))))
 
   ;;
   ;; Start up REPL when configured to do so
@@ -493,9 +680,10 @@
   ;; Store set of run IDs under :excluded-run-ids in db
   ;; Updates asynchronously every 10 seconds
   (go-loop []
-    (update-excluded-runs! db)
-    (<! (timeout 10000))
-    (recur))
+    (let [exclude-files-reload-interval (get-in opts [:config :exclude-files-reload-interval-ms] 60000)]
+      (update-excluded-runs! db)
+      (<! (timeout exclude-files-reload-interval))
+      (recur)))
 
   
   (defonce runs-to-symlink-chan (chan))
@@ -505,32 +693,9 @@
   (defonce kill-analysis-chan (chan))
 
   (start-symlinker! runs-to-symlink-chan db)
-
-  ;;
-  ;; Scan through contents of run-dirs
-  ;; Include only directories (not files)
-  ;; Exclude directories that don't match the illumina run directory naming scheme
-  ;; Exclude those without 'upload_complete.json' file
-  ;; Exclude those runs whose run ID is listed in an exclude file
-  ;; Exclude a run if it is currently being analyzed
-  ;; Take the first run from the remaining list
-  ;; Put it on the runs-to-analyze channel
-  ;; Park for 10 seconds
-  ;; Recur
   (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
 
   (start-analyzer! runs-to-analyze-chan db)
-  ;;
-  ;; Scan through contents of run-dirs
-  ;; Include only directories (not files)
-  ;; Exclude directories that don't match the illumina run directory naming scheme
-  ;; Exclude those without 'upload_complete.json' file
-  ;; Exclude those runs whose run ID is listed in an exclude file
-  ;; Exclude a run if it is currently being analyzed
-  ;; Take the first run from the remaining list
-  ;; Put it on the runs-to-analyze channel
-  ;; Park for 10 seconds
-  ;; Recur
   (start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
 
   ;;
@@ -552,12 +717,6 @@
 
   ;; Clear excluded run list
   (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
-
-  ;; Reload excluded run list from exclude files
-  (doseq [exclude-file-path (get-in @db [:config :exclude-files])]
-    (if (.exists (io/file exclude-file-path))
-      (with-open [rdr (io/reader exclude-file-path)]
-        (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))
   
   (defn mock-analyze!
     ""
