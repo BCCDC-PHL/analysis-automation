@@ -6,7 +6,7 @@
     </encoder>
   </appender>
 
-  <property name="level" value="DEBUG"/>
+  <property name="level" value="INFO"/>
   <logger name="auto-ncov" level="${level}"/>
 
   <root level="INFO">

@@ -9,7 +9,10 @@
                             :primer-pairs-tsv ""
                             :gff ""
                             :composite-ref ""}
- :ncov-tools-nf-config {:version ""}
+ :ncov-tools-nf-config {:version ""
+                        :ncov-watchlists-version ""}
  :config-reload-interval-ms 60000
  :exclude-files-reload-interval-ms 10000
+ :symlinking-scanning-interval-ms 10000
+ :analysis-scanning-interval-ms 10000
  :repl false}
