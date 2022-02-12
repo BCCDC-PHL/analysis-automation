@@ -13,3 +13,17 @@ Options:
   -h, --help
   -v, --version
 ```
+
+## Auto nCoV
+Run the [BCCDC-PHL/ncov2019-artic-nf](https://github.com/BCCDC-PHL/ncov2019-artic-nf) and 
+[BCCDC-PHL/ncov-tools-nf](https://github.com/BCCDC-PHL/ncov-tools-nf) pipelines.
+
+### Usage
+```
+Usage: java -jar auto-ncov.jar OPTIONS
+
+Options:
+  -c, --config CONFIG_FILE Config file.
+  -h, --help
+  -v, --version
+```
