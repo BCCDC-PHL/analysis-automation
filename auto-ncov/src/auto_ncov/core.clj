@@ -364,15 +364,16 @@
      `nil`
   "
   [src dest]
-  (let [src-path (java.nio.file.Paths/get src (into-array String []))
-        dest-path (java.nio.file.Paths/get dest (into-array String []))]
-    (try
+  (try
+    (let [src-path (java.nio.file.Paths/get src (into-array String []))
+          dest-path (java.nio.file.Paths/get dest (into-array String []))]
       (do
         (java.nio.file.Files/deleteIfExists dest-path)
         (java.nio.file.Files/createSymbolicLink dest-path src-path
-                                              (into-array java.nio.file.attribute.FileAttribute [])))
-      (catch java.io.IOException e)
-      (catch java.nio.file.FileAlreadyExistsException e))))
+                                                (into-array java.nio.file.attribute.FileAttribute []))))
+    (catch java.lang.NullPointerException e)
+    (catch java.io.IOException e)
+    (catch java.nio.file.FileAlreadyExistsException e)))
 
 
 (defn symlink!
