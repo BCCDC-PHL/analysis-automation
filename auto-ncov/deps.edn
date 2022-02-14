@@ -9,11 +9,11 @@
  :aliases
  {:build {:deps {io.github.clojure/tools.build {:git/tag "v0.7.5" :git/sha "34727f7"}}
           :ns-default build}
-  :test {:extra-paths ["test"]
+  :test {:extra-paths ["test" "test/resources"]
          :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.0" :git/sha "b3fd0d2"}
                       org.clojure/test.check {:mvn/version "1.1.1"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
-  :test-dev {:extra-paths ["test"]
+  :test-dev {:extra-paths ["test" "test/resources"]
              :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.0" :git/sha "b3fd0d2"}
                           org.clojure/test.check {:mvn/version "1.1.1"}}}}}
