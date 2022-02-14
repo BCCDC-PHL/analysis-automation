@@ -685,7 +685,7 @@
   ;; Start up REPL when configured to do so
   (when (get-in @db [:config :repl])
     (let [uuid (java.util.UUID/randomUUID)
-          socket-dir (str "/tmp/auto-ncov-" (System/getProperty "user.home"))]
+          socket-dir (str "/tmp/auto-ncov-" (System/getProperty "user.name"))]
       (do
         (sh "mkdir" "-p" socket-dir)
         (sh "chmod" "700" socket-dir)
