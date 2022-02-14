@@ -18,6 +18,16 @@
     (t/is (not (core/matches-run-directory-regex? "data")))))
 
 
+(defspec miseq-directory-regex-property 100
+  (prop/for-all [r tgen/miseq-run-id]
+                (t/is (core/matches-run-directory-regex? r))))
+
+
+(defspec nextseq-directory-regex-property 100
+  (prop/for-all [r tgen/nextseq-run-id]
+    (t/is (core/matches-run-directory-regex? r))))
+
+
 (t/deftest currently-analyzing-unit
   (t/testing "Test that we don't determine that a run is analyzing with an empty `db`."
     (let [run-id "220207_M00123_0123_000000000-A7TRG"
@@ -35,6 +45,12 @@
       (t/is (core/currently-analyzing? run-id db)))))
 
 
+(defspec currently-analyzing-property 100
+  (prop/for-all [r (gen/one-of [tgen/miseq-run-id tgen/nextseq-run-id])]
+                (let [db (atom {:currently-analyzing r})]
+                  (t/is (core/currently-analyzing? r db)))))
+
+
 (t/deftest determine-sequencer-type-unit
   (t/testing "Test that we can correctly determine the sequencer type based on the run ID."
     (let [run-id ""]
@@ -45,27 +61,22 @@
       (t/is (= :nextseq (core/determine-sequencer-type run-id))))))
 
 
-
-
 (defspec determine-sequencer-type-property 100
   (prop/for-all [r (gen/one-of [tgen/miseq-run-id tgen/nextseq-run-id])]
                 (t/is (or (= :miseq (core/determine-sequencer-type r))
                           (= :nextseq (core/determine-sequencer-type r))))))
 
 
-(defspec currently-analyzing-property 100
-  (prop/for-all [r (gen/one-of [tgen/miseq-run-id tgen/nextseq-run-id])]
-                (let [db (atom {:currently-analyzing r})]
-                  (t/is (core/currently-analyzing? r db)))))
+(deftest symlink-one!-unit
+  (t/testing "Symlinking with nil returns nil."
+    (let [src nil
+          dest nil]
+      (t/is (nil? (core/symlink-one! src dest))))))
 
 
-(defspec miseq-directory-regex-property 100
-  (prop/for-all [r tgen/miseq-run-id]
-                (t/is (core/matches-run-directory-regex? r))))
 
 
-(defspec nextseq-directory-regex-property 100
-  (prop/for-all [r tgen/nextseq-run-id]
-    (t/is (core/matches-run-directory-regex? r))))
+
+
 
 
