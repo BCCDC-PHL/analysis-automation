@@ -429,7 +429,8 @@
   (go-loop []
     (do
       (log/debug "Scanning for runs to symlink...")
-      (let [run (first (scan-for-runs-to-symlink! db))]
+      (let [_ (update-excluded-runs! db)
+            run (first (scan-for-runs-to-symlink! db))]
         (when-some [r run]
           (do
             (log/info "Found directory to symlink: " run)
@@ -476,7 +477,8 @@
   (go-loop []
     (do
       (log/debug "Scanning for runs to analyze...")
-      (let [run (first (scan-for-runs-to-analyze! db))]
+      (let [_ (update-excluded-runs! db)
+            run (first (scan-for-runs-to-analyze! db))]
         (when-some [r run]
           (do
             (log/info "Found directory to analyze: " run)
