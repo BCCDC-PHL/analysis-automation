@@ -67,16 +67,16 @@
                           (= :nextseq (core/determine-sequencer-type r))))))
 
 
-(deftest symlink-one!-unit
-  (t/testing "Symlinking with nil returns nil."
+(t/deftest symlink-one!-unit
+  (t/testing "Symlinking with nil src and dest returns nil."
     (let [src nil
           dest nil]
+      (t/is (nil? (core/symlink-one! src dest)))))
+  (t/testing "Symlinking with non-nil src and nil dest returns nil."
+    (let [src "src"
+          dest nil]
+      (t/is (nil? (core/symlink-one! src dest)))))
+  (t/testing "Symlinking with non-nil dest and nil dest returns nil."
+    (let [src nil
+          dest "dest"]
       (t/is (nil? (core/symlink-one! src dest))))))
-
-
-
-
-
-
-
-
