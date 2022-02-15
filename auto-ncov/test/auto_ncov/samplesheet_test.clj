@@ -9,13 +9,12 @@
             [auto-ncov.samplesheet :as samplesheet]))
 
 
-#_(t/deftest remove-from-end-unit
-  (t/testing ""
+(t/deftest remove-from-end-unit
+  (t/testing "Remove empty string from empty string returns empty string."
     (t/is (= "" (samplesheet/remove-from-end "" ""))))
-  (t/testing ""
+  (t/testing "Remove non-empty string from empty string returns empty string."
     (t/is (= "" (samplesheet/remove-from-end "" ","))))
-  (t/testing ""
+  (t/testing "Remove empty string from non-empty string returns the original non-empty string."
     (t/is (= "foo" (samplesheet/remove-from-end "foo" ""))))
-  (t/testing ""
-    (t/is (= "foo" (samplesheet/remove-from-end "foo,,," ","))))
-  )
+  (t/testing "Remove non-empty string from non-empty string."
+    (t/is (= "foo" (samplesheet/remove-from-end "foo,,," ",")))))

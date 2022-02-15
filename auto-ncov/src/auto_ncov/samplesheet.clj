@@ -16,10 +16,12 @@
      The String `s`, with all `end` removed from the end. (`String`)
   "
   [s end]
-  (if (.endsWith s end)
-    (remove-from-end (.substring s 0 (- (count s)
-                                        (count end))) end)
-    s))
+  (cond (empty? end) s
+        (.endsWith s end) (remove-from-end (.substring s 0 (- (count s)
+                                                              (count end))) end)
+        (empty? s) s
+        
+        :else s))
 
 
 (defn parse-project-library-ids
