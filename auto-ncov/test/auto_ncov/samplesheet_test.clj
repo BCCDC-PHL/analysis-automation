@@ -18,3 +18,15 @@
     (t/is (= "foo" (samplesheet/remove-from-end "foo" ""))))
   (t/testing "Remove non-empty string from non-empty string."
     (t/is (= "foo" (samplesheet/remove-from-end "foo,,," ",")))))
+
+
+(t/deftest parse-project-library-ids-unit
+  (t/testing ""
+    (let [lines ["[Data]"
+                 "sample-01,"
+                 "sample-02,project"]
+          section-header "[Data]"
+          project-id "project"
+          project-id-column 1
+          library-id-column 0]
+      (t/is (= ["sample-02"] (samplesheet/parse-project-library-ids lines section-header project-id project-id-column library-id-column))))))
