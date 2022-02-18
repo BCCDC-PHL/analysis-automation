@@ -118,22 +118,6 @@
     (.exists upload-complete-path)))
 
 
-(defn symlink-dir-exists?
-  "Check if the corresponding symlinks dir for `run-dir` exists.
-
-   takes:
-     `run-dir`: Path to illumina sequencer output dir. (`String`)
-     `symlinks-dir`: Path to top-level fastq symlinks dir. (`String`)
-
-   returns:
-     `Boolean`
-  "
-  [run-dir symlinks-dir]
-  (let [run-id (.getName (io/file run-dir))
-        symlinks-dir (io/file symlinks-dir run-id)]
-    (.exists symlinks-dir)))
-
-
 (defn symlinks-complete?
   "Check if symlinking is complete, based on the presence of a `symlinks_complete.json` file.
   
@@ -207,7 +191,6 @@
        (filter #(.isDirectory (io/file %)))
        (filter matches-run-directory-regex?)
        (filter upload-complete?)
-       (filter #(not (symlink-dir-exists? % symlinks-dir)))
        (filter #(not (contains? excluded-run-ids (.getName (io/file %)))))))
 
 
@@ -227,6 +210,79 @@
     (-> (map scan-directory! run-dirs)
         flatten
         (filter-for-runs-to-symlink symlinks-dir excluded-run-ids))))
+
+(defn find-fastq-directory!
+  "Given a run directory, find the directory containing fastq files.
+   MiSeqs store fastq files under `Data/Intensities/BaseCalls`.
+   NextSeqs store fastq files under `Analysis/N/Data/fastq`, where `N` is
+   the number of times that demultiplexing has been performed.
+   In most cases, `N` is 1, but in cases where we have repeated demultiplexing,
+   we want to take the fastq files from the most recent (highest numbered) Analysis directory.
+
+   takes:
+     `run-dir`: Path to an illumina sequencer output directory. (`String`)
+
+   returns:
+      Path to fastq directory within `run-dir`. (`String`)
+
+   throws:
+     `Exception`: If sequencer type is not `:miseq` or `:nextseq`, cannot determine fastq directory.
+  "
+  [run-dir]
+  (let [sequencer-type (determine-sequencer-type (.getName (io/file run-dir)))]
+    (cond (= sequencer-type :miseq) (.getCanonicalPath (io/file run-dir "Data" "Intensities" "BaseCalls"))
+          (= sequencer-type :nextseq) (-> (io/file run-dir "Analysis")
+                                          .listFiles
+                                          last
+                                          (io/file "Data" "fastq")
+                                          .getCanonicalPath)
+          :else (throw (Exception. "Unknown sequencer type. Cannot find fastq files.")))))
+
+
+(defn find-fastqs-by-library-id
+  "Look for fastq files for a specific library ID within an illumina sequencer output directory.
+
+   takes:
+     `run-dir`:
+     `library-id`:
+  "
+  [run-dir library-id]
+  (let [fastq-dir (find-fastq-directory! run-dir)
+        fastq-paths (filter #(re-find #".fastq.gz$" %)
+                            (map (memfn getCanonicalPath)
+                                 (.listFiles (io/file fastq-dir))))
+        r1-regex  (re-pattern (str library-id "_S\\d+_L\\d+_R1_\\d+.fastq.gz"))
+        fastq-r1  (first (filter #(re-find r1-regex %) fastq-paths))
+        r2-regex  (re-pattern (str library-id "_S\\d+_L\\d+_R2_\\d+.fastq.gz"))
+        fastq-r2  (first (filter #(re-find r2-regex %) fastq-paths))]
+    [fastq-r1 fastq-r2]))
+
+
+(defn scan-for-libraries-to-symlink!
+  "Scan through a run directory for libraries to symlink.
+
+   takes:
+     `run-dir`: Path to illumina sequencer output directory (`String`)
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     Sequence of pairs of fastq paths (`[[String]]`)
+     eg:
+       ```
+       ([\"/path/to/sample-01_R1.fastq.gz\"
+         \"/path/to/sample-01_R2.fastq.gz\"]
+        [\"/path/to/sample-02_R1.fastq.gz\"
+         \"/path/to/sample-02_R2.fastq.gz\"]
+        ...)
+       ```
+  "
+  [run-dir db]
+  (let [symlinks-dir        (get-in @db [:config :symlinks-dir])
+        excluded-run-ids    (get @db :excluded-run-ids)
+        project-id          (get-in @db [:config :samplesheet-project-id])
+        samplesheet-path    (find-samplesheet! run-dir)
+        project-library-ids (get-project-library-ids-from-samplesheet! samplesheet-path project-id)]
+    (map #(find-fastqs-by-library-id run-dir %) project-library-ids)))
 
 
 (defn filter-for-runs-to-analyze
@@ -324,32 +380,7 @@
           :else '())))
 
 
-(defn find-fastq-directory!
-  "Given a run directory, find the directory containing fastq files.
-   MiSeqs store fastq files under `Data/Intensities/BaseCalls`.
-   NextSeqs store fastq files under `Analysis/N/Data/fastq`, where `N` is
-   the number of times that demultiplexing has been performed.
-   In most cases, `N` is 1, but in cases where we have repeated demultiplexing,
-   we want to take the fastq files from the most recent (highest numbered) Analysis directory.
 
-   takes:
-     `run-dir`: Path to an illumina sequencer output directory. (`String`)
-
-   returns:
-      Path to fastq directory within `run-dir`. (`String`)
-
-   throws:
-     `Exception`: If sequencer type is not `:miseq` or `:nextseq`, cannot determine fastq directory.
-  "
-  [run-dir]
-  (let [sequencer-type (determine-sequencer-type (.getName (io/file run-dir)))]
-    (cond (= sequencer-type :miseq) (.getCanonicalPath (io/file run-dir "Data" "Intensities" "BaseCalls"))
-          (= sequencer-type :nextseq) (-> (io/file run-dir "Analysis")
-                                          .listFiles
-                                          last
-                                          (io/file "Data" "fastq")
-                                          .getCanonicalPath)
-          :else (throw (Exception. "Unknown sequencer type. Cannot find fastq files.")))))
 
 
 (defn symlink-one!
@@ -393,14 +424,13 @@
         fastq-src-paths     (filter #(re-find #".fastq.gz$" %)
                                     (map (memfn getCanonicalPath)
                                          (.listFiles (io/file fastq-src-dir))))
-        symlinks-dest-dir   (.getCanonicalPath (io/file symlinks-dir run-id))
+        symlinks-dest-dir   symlinks-dir
         samplesheet-path    (find-samplesheet! run-dir)
         project-library-ids (get-project-library-ids-from-samplesheet! samplesheet-path project-id)
         symlinks-complete   {:destination_directory symlinks-dest-dir
                              :num_symlinks_created (count project-library-ids)
                              :source_directory run-dir}]
     (do
-      (.mkdir (io/file symlinks-dest-dir))
       (doseq [library-id project-library-ids]
         (let [r1-regex (re-pattern (str library-id "_S\\d+_L\\d+_R1_\\d+.fastq.gz"))
               src-r1   (first (filter #(re-find r1-regex %) fastq-src-paths))
@@ -410,9 +440,7 @@
               dest-r2  (.getPath (io/file symlinks-dest-dir (str library-id "_R2.fastq.gz")))]
           (symlink-one! src-r1 dest-r1)
           (symlink-one! src-r2 dest-r2)))
-      (spit (str (io/file symlinks-dest-dir "symlinks_complete.json"))
-            (with-out-str (json/pprint (assoc symlinks-complete :timestamp (now!)) :escape-slash false)))
-      (log/info (str "Symlinks complete: " symlinks-dest-dir)))))
+      (log/info (str "Symlinks complete.")))))
 
 
 (defn start-scanning-for-runs-to-symlink!
@@ -694,8 +722,8 @@
   (defonce runs-to-analyze-chan (chan))
   (defonce kill-analysis-chan (chan))
 
-  #_(start-symlinker! runs-to-symlink-chan db)
-  #_(start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
+  (start-symlinker! runs-to-symlink-chan db)
+  (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
 
   #_(start-analyzer! runs-to-analyze-chan db)
   #_(start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
@@ -711,6 +739,9 @@
   ;; Useful forms for REPL-driven development
 
   (def opts {:options {:config "dev-config.edn"}})
+
+  ;; create app db
+  (defonce db (atom {}))
 
   ;; Reload config
   (update-config! (get-in opts [:options :config]) db)
