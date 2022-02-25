@@ -77,7 +77,7 @@
      `nil`
   "
   [db]
-  (let [exclude-file-paths (get-in @db [:config :exclude-files])]
+  (let [exclude-file-paths (get-in @db [:config :run-exclude-files])]
     (when (some? exclude-file-paths)
       (dosync
        (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
@@ -85,6 +85,27 @@
          (if (.exists (io/file exclude-file-path))
            (with-open [rdr (io/reader exclude-file-path)]
              (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))))))
+
+
+(defn update-excluded-libraries!
+  "Update `db` by loading excluded run IDs from files and inserting under
+   key `:excluded-library-ids`.
+
+   takes:
+     `db`: Global app-state db (`Atom`)
+
+   returns:
+     `nil`
+  "
+  [db]
+  (let [exclude-file-paths (get-in @db [:config :library-exclude-files])]
+    (when (some? exclude-file-paths)
+      (dosync
+       (swap! db (fn [x] (assoc x :excluded-library-ids #{})))
+       (doseq [exclude-file-path exclude-file-paths]
+         (if (.exists (io/file exclude-file-path))
+           (with-open [rdr (io/reader exclude-file-path)]
+             (swap! db (fn [x] (assoc x :excluded-library-ids (set/union (:excluded-library-ids x) (into #{} (line-seq rdr)))))))))))))
 
 
 (defn matches-run-directory-regex?
@@ -205,11 +226,28 @@
   "
   [db]
   (let [run-dirs              (get-in @db [:config :run-dirs])
-        symlinks-dir          (get-in @db [:config :symlinks-dir])
+        symlinks-dir          (get-in @db [:config :fastq-symlinks-dir])
         excluded-run-ids      (get @db :excluded-run-ids)]
     (-> (map scan-directory! run-dirs)
         flatten
         (filter-for-runs-to-symlink symlinks-dir excluded-run-ids))))
+
+
+(defn determine-sequencer-type
+  "Determine the type of sequencer, based on the run ID.
+
+   takes:
+     `run-id`: The run ID (`String`)
+
+   returns:
+     The sequencer type, one of: `:miseq`, `:nextseq`, or `:unknown`. (`Keyword`)  
+  "
+  [run-id]
+  (cond
+    (re-matches #"\d{6}_M[0-9]{5}_\d{4}_[0]{9}-[A-Z0-9]{5}" run-id) :miseq
+    (re-matches #"\d{6}_VH[0-9]{5}_\d+_[A-Z0-9]{9}" run-id) :nextseq
+    :else :unknown))
+
 
 (defn find-fastq-directory!
   "Given a run directory, find the directory containing fastq files.
@@ -245,6 +283,9 @@
    takes:
      `run-dir`:
      `library-id`:
+
+   returns:
+     Vector of paths to fastq files for the library matching `library-id`. (`[String]`)
   "
   [run-dir library-id]
   (let [fastq-dir (find-fastq-directory! run-dir)
@@ -256,6 +297,45 @@
         r2-regex  (re-pattern (str library-id "_S\\d+_L\\d+_R2_\\d+.fastq.gz"))
         fastq-r2  (first (filter #(re-find r2-regex %) fastq-paths))]
     [fastq-r1 fastq-r2]))
+
+
+(defn find-samplesheet!
+  "Find the SampleSheet file within an illumina sequencer output directory.
+
+   takes:
+     `run-dir`: Path to illumina sequencer output directory (String)
+
+   returns:
+     Path to SampleSheet file. (String)
+  "
+  [run-dir]
+  (->> (io/file run-dir)
+      .listFiles
+      (filter #(re-find #"SampleSheet[a-zA-Z0-9\-_]*.csv" (.getName %)))
+      first
+      str))
+
+
+(defn get-project-library-ids-from-samplesheet!
+  "Get a list of library IDs for libraries belonging to this project in the SampleSheet.
+
+   takes:
+     `samplesheet-path`: Path to SampleSheet file (`String`)
+     `project-id`: Project ID used to identify samples for this project in the SampleSheet (`String`)
+
+   returns:
+     Sequence of library IDs. (`[String]`)
+  "
+  [samplesheet-path project-id]
+  (let [run-id (.getName (.getParentFile (io/file samplesheet-path)))
+        samplesheet-lines (with-open [rdr (io/reader samplesheet-path)]
+                            (-> (doall (line-seq rdr))))
+        sequencer-type (determine-sequencer-type run-id)]
+    (cond (= (determine-sequencer-type run-id) :miseq)
+          (samplesheet/parse-project-library-ids-miseq samplesheet-lines project-id)
+          (= (determine-sequencer-type run-id) :nextseq)
+          (samplesheet/parse-project-library-ids-nextseq samplesheet-lines project-id)
+          :else '())))
 
 
 (defn scan-for-libraries-to-symlink!
@@ -277,7 +357,7 @@
        ```
   "
   [run-dir db]
-  (let [symlinks-dir        (get-in @db [:config :symlinks-dir])
+  (let [symlinks-dir        (get-in @db [:config :fastq-symlinks-dir])
         excluded-run-ids    (get @db :excluded-run-ids)
         project-id          (get-in @db [:config :samplesheet-project-id])
         samplesheet-path    (find-samplesheet! run-dir)
@@ -320,67 +400,9 @@
      Sequence of fastq symlinks directories ([String])
   "
   [db]
-  (let [symlinks-dir (get-in @db [:config :symlinks-dir])]
+  (let [symlinks-dir (get-in @db [:config :fastq-symlinks-dir])]
     (-> (scan-directory! symlinks-dir)
         (filter-for-runs-to-analyze db))))
-
-
-(defn find-samplesheet!
-  "Find the SampleSheet file within an illumina sequencer output directory.
-
-   takes:
-     `run-dir`: Path to illumina sequencer output directory (String)
-
-   returns:
-     Path to SampleSheet file. (String)
-  "
-  [run-dir]
-  (->> (io/file run-dir)
-      .listFiles
-      (filter #(re-find #"SampleSheet[a-zA-Z0-9\-_]*.csv" (.getName %)))
-      first
-      str))
-
-
-(defn determine-sequencer-type
-  "Determine the type of sequencer, based on the run ID.
-
-   takes:
-     `run-id`: The run ID (`String`)
-
-   returns:
-     The sequencer type, one of: `:miseq`, `:nextseq`, or `:unknown`. (`Keyword`)  
-  "
-  [run-id]
-  (cond
-    (re-matches #"\d{6}_M[0-9]{5}_\d{4}_[0]{9}-[A-Z0-9]{5}" run-id) :miseq
-    (re-matches #"\d{6}_VH[0-9]{5}_\d+_[A-Z0-9]{9}" run-id) :nextseq
-    :else :unknown))
-
-
-(defn get-project-library-ids-from-samplesheet!
-  "Get a list of library IDs for libraries belonging to this project in the SampleSheet.
-
-   takes:
-     `samplesheet-path`: Path to SampleSheet file (`String`)
-     `project-id`: Project ID used to identify samples for this project in the SampleSheet (`String`)
-
-   returns:
-     Sequence of library IDs. (`[String]`)
-  "
-  [samplesheet-path project-id]
-  (let [run-id (.getName (.getParentFile (io/file samplesheet-path)))
-        samplesheet-lines (with-open [rdr (io/reader samplesheet-path)]
-                            (-> (doall (line-seq rdr))))
-        sequencer-type (determine-sequencer-type run-id)]
-    (cond (= (determine-sequencer-type run-id) :miseq)
-          (samplesheet/parse-project-library-ids-miseq samplesheet-lines project-id)
-          (= (determine-sequencer-type run-id) :nextseq)
-          (samplesheet/parse-project-library-ids-nextseq samplesheet-lines project-id)
-          :else '())))
-
-
-
 
 
 (defn symlink-one!
@@ -407,40 +429,101 @@
     (catch java.nio.file.FileAlreadyExistsException e)))
 
 
-(defn symlink!
-  "Create symlinks from run-dir to `symlinks-dir`, for samples belonging to `project-id`.
+(defn get-fastq-paths!
+  "Get paths for any libraries in `run-dir` that 
 
    takes:
-     `run-dir`: Path to illumina sequencer output directory to create symlinks for. (`String`) 
-     `symlinks-dir`: Path to top-level fastq symlinks directory for the project. (`String`)
      `project-id`: Identifier used to mark libraries as belonging to this project in the SampleSheet file. (`String`)
+     `run-dir`: Path to illumina sequencer output directory to create symlinks for. (`String`)
+     
 
    returns:
-     `nil`
+     Sequence of maps, each with keys:
+       `:library-id` Library ID (`String`)
+       `:r1-path`    Path to R1 fastq file (`String`)
+       `:r2-path`    Path to R2 fastq file (`String`)
   "
-  [run-dir symlinks-dir project-id]
+  [project-id run-dir]
   (let [run-id              (.getName (io/file run-dir))
         fastq-src-dir       (find-fastq-directory! run-dir)
         fastq-src-paths     (filter #(re-find #".fastq.gz$" %)
                                     (map (memfn getCanonicalPath)
                                          (.listFiles (io/file fastq-src-dir))))
-        symlinks-dest-dir   symlinks-dir
         samplesheet-path    (find-samplesheet! run-dir)
-        project-library-ids (get-project-library-ids-from-samplesheet! samplesheet-path project-id)
-        symlinks-complete   {:destination_directory symlinks-dest-dir
-                             :num_symlinks_created (count project-library-ids)
-                             :source_directory run-dir}]
-    (do
-      (doseq [library-id project-library-ids]
-        (let [r1-regex (re-pattern (str library-id "_S\\d+_L\\d+_R1_\\d+.fastq.gz"))
-              src-r1   (first (filter #(re-find r1-regex %) fastq-src-paths))
-              dest-r1  (.getPath (io/file symlinks-dest-dir (str library-id "_R1.fastq.gz")))
-              r2-regex (re-pattern (str library-id "_S\\d+_L\\d+_R2_\\d+.fastq.gz"))
-              src-r2   (first (filter #(re-find r2-regex %) fastq-src-paths))
-              dest-r2  (.getPath (io/file symlinks-dest-dir (str library-id "_R2.fastq.gz")))]
-          (symlink-one! src-r1 dest-r1)
-          (symlink-one! src-r2 dest-r2)))
-      (log/info (str "Symlinks complete.")))))
+        project-library-ids (get-project-library-ids-from-samplesheet! samplesheet-path project-id)]
+    (->> project-library-ids
+         (map (fn [library-id]
+                (let [r1-regex (re-pattern (str library-id "_S\\d+_L\\d+_R1_\\d+.fastq.gz"))
+                      r1-path  (first (filter #(re-find r1-regex %) fastq-src-paths))
+                      r2-regex (re-pattern (str library-id "_S\\d+_L\\d+_R2_\\d+.fastq.gz"))
+                      r2-path  (first (filter #(re-find r2-regex %) fastq-src-paths))]
+                      {:library-id   library-id
+                       :r1-path  r1-path
+                       :r2-path  r2-path}))))))
+
+
+(defn add-symlink-dest-path
+  "Given a map of fastq file paths, add paths to symlink destinations.
+
+   takes:
+     `fastq-paths`:
+       `Map` with keys:
+         `:library-id` Library ID (`String`)
+         `:r1-path`    Path to R1 fastq file (`String`)
+         `:r2-path`    Path to R2 fastq file (`String`)
+      `fastq-symlinks-dir`: Path to directory to create fastq symlinks in (`String`)
+
+   returns:
+     `Map` with keys:
+       `:library-id`   Library ID (`String`)
+       `:r1-src-path`  Path to R1 fastq file (`String`)
+       `:r1-dest-path` Path to R1 fastq file (`String`)
+       `:r2-src-path`  Path to R2 fastq file (`String`)
+       `:r2-dest-path` Path to R2 fastq file (`String`)
+  "
+  [fastq-paths fastq-symlinks-dir]
+  (let [{:keys [library-id r1-path r2-path]} fastq-paths
+        r1-src-path  r1-path
+        r1-dest-path (str (io/file fastq-symlinks-dir (str library-id "_R1.fastq.gz")))
+        r2-src-path  r2-path
+        r2-dest-path (str (io/file fastq-symlinks-dir (str library-id "_R2.fastq.gz")))]
+    {:library-id   library-id
+     :r1-src-path  r1-src-path
+     :r1-dest-path r1-dest-path
+     :r2-src-path  r2-src-path
+     :r2-dest-path r2-dest-path}))
+
+
+(defn symlink!
+  "Create symlinks for each library in `fastq-paths`, under `fastq-symlinks-dir`.
+
+   takes:
+     `fastq-paths`: `Map` with keys:
+       `:library-id`   Library ID (`String`)
+       `:r1-src-path`  Path to source R1 fastq file (`String`)
+       `:r1-dest-path` Path to destination R1 symlink (`String`)
+       `:r2-src-path`  Path to source R2 fastq file (`String`)
+       `:r2-dest-path` Path to destination R2 symlink (`String`)
+  
+      `libraries-to-analyze-chan`: (`Channel`)
+
+   returns:
+     `nil`
+  "
+  [fastq-paths libraries-to-analyze-chan db]
+  (let [{:keys [library-id r1-src-path r1-dest-path r2-src-path r2-dest-path]} fastq-paths
+        r1-symlink-exists (.exists (io/file r1-dest-path))
+        r2-symlink-exists (.exists (io/file r1-dest-path))
+        both-symlinks-exist (and r1-symlink-exists r2-symlink-exists)]
+    (when (and (not both-symlinks-exist) (not (contains? (:excluded-library-ids @db) library-id)))
+      (do
+        (symlink-one! r1-src-path r1-dest-path)
+        (symlink-one! r2-src-path r2-dest-path)
+        (let [library-to-analyze {:library-id library-id
+                                  :r1-path r1-dest-path
+                                  :r2-path r2-dest-path}]
+          (put! libraries-to-analyze-chan library-to-analyze)
+          (log/info "Put on analysis channel: " library-to-analyze))))))
 
 
 (defn start-scanning-for-runs-to-symlink!
@@ -481,13 +564,17 @@
    returns:
      (`Channel`)
   "
-  [runs-to-symlink-chan db]
+  [runs-to-symlink-chan libraries-to-analyze-chan db]
   (go-loop [run (<! runs-to-symlink-chan)]
-    (log/debug (str "Took from symlink channel: " run))
+    (log/info (str "Took from symlink channel: " run))
     (when-some [r run]
-      (let [symlinks-dir (get-in @db [:config :symlinks-dir])
+      (let [symlinks-dir (get-in @db [:config :fastq-symlinks-dir])
             project-id   (get-in @db [:config :samplesheet-project-id])]
-        (symlink! run symlinks-dir project-id)))
+        (->> r
+             (get-fastq-paths! project-id)
+             (map #(add-symlink-dest-path % symlinks-dir))
+             (#(doseq [library %] (symlink! library libraries-to-analyze-chan db))))))
+
     (recur (<! runs-to-symlink-chan))))
 
 
@@ -712,6 +799,7 @@
   (go-loop []
     (let [exclude-files-reload-interval (get-in opts [:config :exclude-files-reload-interval-ms] 60000)]
       (update-excluded-runs! db)
+      (update-excluded-libraries! db)
       (<! (timeout exclude-files-reload-interval))
       (recur)))
 
@@ -747,9 +835,27 @@
   (update-config! (get-in opts [:options :config]) db)
 
   (update-excluded-runs! db)
+  (update-excluded-libraries! db)
 
   ;; Clear excluded run list
   (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
+
+
+  (defonce runs-to-symlink-chan (chan))
+  (defonce kill-symlinking-chan (chan))
+
+  (defonce libraries-to-analyze-chan (chan))
+  (defonce kill-analysis-chan (chan))
+
+  ;; Control symlinking process
+  (start-symlinker! runs-to-symlink-chan libraries-to-analyze-chan db)
+  (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
+  (put-stop! kill-symlinking-chan)
+
+  
+  (start-analyzer! runs-to-analyze-chan db)
+  (start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
+  (put-stop! kill-analysis-chan)
   
   (defn mock-analyze!
     "Mock analysis by sleeping for 10s"
