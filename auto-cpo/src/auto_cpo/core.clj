@@ -207,12 +207,16 @@
    returns:
      Filtered sequence of paths to illumina sequencer output dirs. (`[String]`)
   "
-  [paths symlinks-dir excluded-run-ids]
-  (->> paths
+  [paths db]
+  (let [symlinks-dir              (get-in @db [:config :fastq-symlinks-dir])
+        excluded-run-ids          (get @db :excluded-run-ids)
+        previously-symlinked-runs (get @db :symlinked-runs)]
+      (->> paths
        (filter #(.isDirectory (io/file %)))
        (filter matches-run-directory-regex?)
        (filter upload-complete?)
-       (filter #(not (contains? excluded-run-ids (.getName (io/file %)))))))
+       (filter #(not (contains? excluded-run-ids (.getName (io/file %)))))
+       (filter #(not (contains? previously-symlinked-runs (.getName (io/file %))))))))
 
 
 (defn scan-for-runs-to-symlink!
@@ -230,7 +234,7 @@
         excluded-run-ids      (get @db :excluded-run-ids)]
     (-> (map scan-directory! run-dirs)
         flatten
-        (filter-for-runs-to-symlink symlinks-dir excluded-run-ids))))
+        (filter-for-runs-to-symlink db))))
 
 
 (defn determine-sequencer-type
@@ -532,7 +536,7 @@
 
 
 (defn symlink!
-  "Create symlinks for each library in `fastq-paths`, under `fastq-symlinks-dir`.
+  "Create symlinks for the library in `fastq-paths`, under `fastq-symlinks-dir`.
 
    takes:
      `fastq-paths`: `Map` with keys:
@@ -592,6 +596,23 @@
           (recur))))))
 
 
+(defn mark-as-symlinked
+  "Add the run ID to `db` under the key `:symlinked-runs`.
+
+   takes:
+     `db`: Global app-state db (`Atom`)
+     `run-path` Path to illumina output directory for the run (`String`)
+
+   returns:
+     `Map`, the updated state of the global app-state db.
+  "
+  [db run-path]
+  (let [run-id (.getName (io/file run-path))]
+    (if (not (contains? @db :symlinked-runs))
+      (swap! db assoc :symlinked-runs #{run-id})
+      (swap! db update :symlinked-runs conj run-id))))
+  
+
 (defn start-symlinker!
   "Starts the (asynchronous) process of symlinking any directories put on `runs-to-symlink-chan`.
 
@@ -611,7 +632,8 @@
         (->> r
              (get-fastq-paths! project-id)
              (map #(add-symlink-dest-path % symlinks-dir))
-             (#(doseq [library %] (symlink! library libraries-to-analyze-chan db))))))
+             (#(doseq [library %] (symlink! library libraries-to-analyze-chan db)))))
+      (mark-as-symlinked db r))
 
     (recur (<! runs-to-symlink-chan))))
 
