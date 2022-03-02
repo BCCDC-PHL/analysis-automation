@@ -72,7 +72,7 @@
 
    takes:
      `db`: Global app-state db (`Atom`)
-
+  
    returns:
      `nil`
   "
@@ -419,8 +419,13 @@
   [src dest]
   (try
     (let [src-path (java.nio.file.Paths/get src (into-array String []))
-          dest-path (java.nio.file.Paths/get dest (into-array String []))]
+          dest-path (java.nio.file.Paths/get dest (into-array String []))
+          dest-parent-dir (.getParentFile (io/file (str dest-path)))]
       (do
+        (when (not (.exists dest-parent-dir))
+          (do
+            (log/info "Creating directory: " (str dest-parent-dir))
+            (io/make-parents (str dest-path))))
         (java.nio.file.Files/deleteIfExists dest-path)
         (java.nio.file.Files/createSymbolicLink dest-path src-path
                                                 (into-array java.nio.file.attribute.FileAttribute []))))
@@ -462,11 +467,42 @@
                        :r2-path  r2-path}))))))
 
 
+(defn fastq-symlinks-subdir-by-year
+  "Given a map with library ID and fastq paths, determine the sub-directory
+   under the `:fastq-symlinks-dir` config value to create fastq symlinks,
+   based on the sample-collection year that is embedded in the library ID for
+   CPO samples.
+
+   If the year cannot be determined from the ID, the current year at the time of
+   symlinking will be used.
+
+   takes:
+     `library-fastq-paths`:
+       `Map` with keys:
+         `:library-id` Library ID (`String`)
+         `:r1-path`    Path to R1 fastq file (`String`)
+         `:r2-path`    Path to R2 fastq file (`String`)
+      `fastq-symlinks-dir`: Path to directory to create fastq symlinks in (`String`)
+
+   returns:
+     Sub-directory name (`String`)
+  "
+  [library-fastq-paths]
+  (let [library-id (:library-id library-fastq-paths)
+        current-year (first (str/split (now!) #"-"))
+        current-two-digit-year (apply str (drop 2 current-year))
+        library-year-regex #"BC(\d{2})[A-Z]"
+        library-two-digit-year-matches (re-find library-year-regex library-id)]
+    (if (> (count library-two-digit-year-matches) 1)
+      (second library-two-digit-year-matches)
+      current-two-digit-year)))
+
+
 (defn add-symlink-dest-path
   "Given a map of fastq file paths, add paths to symlink destinations.
 
    takes:
-     `fastq-paths`:
+     `library-fastq-paths`:
        `Map` with keys:
          `:library-id` Library ID (`String`)
          `:r1-path`    Path to R1 fastq file (`String`)
@@ -481,12 +517,13 @@
        `:r2-src-path`  Path to R2 fastq file (`String`)
        `:r2-dest-path` Path to R2 fastq file (`String`)
   "
-  [fastq-paths fastq-symlinks-dir]
-  (let [{:keys [library-id r1-path r2-path]} fastq-paths
+  [library-fastq-paths fastq-symlinks-dir]
+  (let [{:keys [library-id r1-path r2-path]} library-fastq-paths
+        fastq-symlinks-subdir (fastq-symlinks-subdir-by-year library-fastq-paths)
         r1-src-path  r1-path
-        r1-dest-path (str (io/file fastq-symlinks-dir (str library-id "_R1.fastq.gz")))
+        r1-dest-path (str (io/file fastq-symlinks-dir fastq-symlinks-subdir (str library-id "_R1.fastq.gz")))
         r2-src-path  r2-path
-        r2-dest-path (str (io/file fastq-symlinks-dir (str library-id "_R2.fastq.gz")))]
+        r2-dest-path (str (io/file fastq-symlinks-dir fastq-symlinks-subdir (str library-id "_R2.fastq.gz")))]
     {:library-id   library-id
      :r1-src-path  r1-src-path
      :r1-dest-path r1-dest-path
@@ -520,6 +557,7 @@
         (symlink-one! r1-src-path r1-dest-path)
         (symlink-one! r2-src-path r2-dest-path)
         (let [library-to-analyze {:library-id library-id
+                                  :analysis-stage :assembly
                                   :r1-path r1-dest-path
                                   :r2-path r2-dest-path}]
           (put! libraries-to-analyze-chan library-to-analyze)
@@ -547,7 +585,7 @@
           (do
             (log/info "Found directory to symlink: " run)
             (>! runs-to-symlink-chan r))))
-      (let [symlinks-scanning-interval (get-in @db [:config :symlinks-scanning-interval-ms] 10000)
+      (let [symlinks-scanning-interval (get-in @db [:config :symlinking-scanning-interval-ms] 10000)
             [v ch] (async/alts! [(timeout symlinks-scanning-interval) kill-chan])]
         (if (= ch kill-chan)
           (log/info "Stopped scanning for runs to symlink.")
@@ -807,10 +845,10 @@
   (defonce runs-to-symlink-chan (chan))
   (defonce kill-symlinking-chan (chan))
 
-  (defonce runs-to-analyze-chan (chan))
+  (defonce libraries-to-analyze-chan (chan))
   (defonce kill-analysis-chan (chan))
 
-  (start-symlinker! runs-to-symlink-chan db)
+  (start-symlinker! runs-to-symlink-chan libraries-to-analyze-chan db)
   (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
 
   #_(start-analyzer! runs-to-analyze-chan db)
@@ -851,7 +889,7 @@
   (start-symlinker! runs-to-symlink-chan libraries-to-analyze-chan db)
   (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
   (put-stop! kill-symlinking-chan)
-
+ 
   
   (start-analyzer! runs-to-analyze-chan db)
   (start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
