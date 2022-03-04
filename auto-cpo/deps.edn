@@ -4,6 +4,7 @@
         ch.qos.logback/logback-classic {:mvn/version "1.2.10"}
         org.clojure/core.async {:mvn/version "1.5.648"}
         org.clojure/data.json {:mvn/version "2.4.0"}
+        org.clojure/data.csv {:mvn/version "1.0.0"}
         nrepl/nrepl {:mvn/version "0.9.0"}
         com.kohlschutter.junixsocket/junixsocket-core {:mvn/version "2.3.2"}}
  :aliases

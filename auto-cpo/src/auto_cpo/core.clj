@@ -9,11 +9,13 @@
             [clojure.java.shell :as shell :refer [sh]]
             [clojure.core.async :as async :refer [go go-loop chan onto-chan! put! take! <! <!! >! >!! timeout]]
             [clojure.data.json :as json]
+            [clojure.data.csv :as csv]
             [nrepl.server :refer [start-server stop-server]]
             [auto-cpo.cli :as cli]
             [auto-cpo.samplesheet :as samplesheet])
   (:import [java.time.format DateTimeFormatter]
-           [java.time ZonedDateTime])
+           [java.time ZonedDateTime]
+           [java.io File])
   (:gen-class))
 
 
@@ -48,6 +50,16 @@
       (printf "Couldn't open '%s': %s\n" source (.getMessage e)))
     (catch RuntimeException e
       (printf "Error parsing edn file '%s': %s\n" source (.getMessage e)))))
+
+
+(defn maps->csv-data 
+  "Takes a collection of maps and returns csv-data 
+   (vector of vectors with all values)."       
+   [maps]
+   (let [columns (-> maps first keys)
+         headers (mapv name columns)
+         rows (mapv #(mapv % columns) maps)]
+     (into [headers] rows)))
 
 
 (defn update-config!
@@ -168,12 +180,6 @@
   (let [run-id (.getName (io/file symlinks-dir))
         analysis-dir (io/file analysis-output-dir run-id)]
     (.exists analysis-dir)))
-
-
-(defn currently-analyzing?
-  "Check if a run directory is currently being analyzed."
-  [run-dir db]
-  (= (:currently-analyzing @db) run-dir))
 
 
 (defn scan-directory!
@@ -502,6 +508,26 @@
       current-two-digit-year)))
 
 
+(defn library-id->year
+  "Extract the year from a library ID. Assumes that `library-id` starts with \"BC\", followed by a
+   two-digit year, followed by a letter A-Z.
+   takes:
+     `library-id`: Library ID (`String`)
+
+   returns:
+     Two-digit year (`String`)
+
+   eg: (library-id->year \"BC21A001A\") => \"21\"
+       (library-id->year \"BC17B135A\") => \"17\"
+       (library-id->year \"A\") => nil
+  "
+  [library-id]
+  (let [library-year-regex #"BC(\d{2})[A-Z]"
+        library-two-digit-year-matches (re-find library-year-regex library-id)]
+    (when (> (count library-two-digit-year-matches) 1)
+      (second library-two-digit-year-matches))))
+
+
 (defn add-symlink-dest-path
   "Given a map of fastq file paths, add paths to symlink destinations.
 
@@ -523,7 +549,8 @@
   "
   [library-fastq-paths fastq-symlinks-dir]
   (let [{:keys [library-id r1-path r2-path]} library-fastq-paths
-        fastq-symlinks-subdir (fastq-symlinks-subdir-by-year library-fastq-paths)
+        library-id-year (library-id->year library-id)
+        fastq-symlinks-subdir (if (nil? library-id-year) (apply str (drop 2 (first (str/split (now!) #"-")))) library-id-year)
         r1-src-path  r1-path
         r1-dest-path (str (io/file fastq-symlinks-dir fastq-symlinks-subdir (str library-id "_R1.fastq.gz")))
         r2-src-path  r2-path
@@ -638,41 +665,13 @@
     (recur (<! runs-to-symlink-chan))))
 
 
-(defn start-scanning-for-runs-to-analyze!
-  "Starts the (asynchronous) process of scanning for runs to analyze.
-
-   takes:
-     `runs-to-analyze-chan`: Channel to put fastq symlink directories on for analysis. (`Channel`)
-     `kill-chan`: Channel for killing the scanning process. (`Channel`)
-     `db`: Global app-state db (`Atom`)
-
-   returns:
-     (`Channel`)
-  "
-  [runs-to-analyze-chan kill-chan db]
-  (go-loop []
-    (do
-      (log/debug "Scanning for runs to analyze...")
-      (let [_ (update-excluded-runs! db)
-            run (first (scan-for-runs-to-analyze! db))]
-        (when-some [r run]
-          (do
-            (log/info "Found directory to analyze: " run)
-            (>! runs-to-analyze-chan r))))
-      (let [analysis-scanning-interval (get-in @db [:config :analysis-scanning-interval-ms] 10000)
-            [v ch] (async/alts! [(timeout analysis-scanning-interval) kill-chan])]
-        (if (= ch kill-chan)
-          (log/info "Stopped scanning for runs to analyze.")
-          (recur))))))
-
-
 (defn put-stop!
   "Stop a process by putting a value on the `kill-chan`.
 
    takes:
      `kill-chan`: Channel to put a value on to kill an async process. (`Channel`)
 
-   returns:
+    returns:
      `boolean`
   "
   [kill-chan]
@@ -684,48 +683,52 @@
    When the analysis completes, delete the 'work' directory.
 
    takes:
+     `libraries`: 
      `db`: Global app-state db (`Atom`)
 
    returns:
-     Path to analysis output directory. (`String`)
+     
   "
   [libraries db]
-  (let [samplesheet            ""
-        assembly-output-dir    (get-in @db [:config :assembly-output-dir])
+  (let [output-dir             (get-in @db [:config :analysis-output-dir])
         pipeline-full-name     "BCCDC-PHL/routine-assembly"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
         pipeline-full-version  (get-in @db [:config :routine-assembly-config :version])
         pipeline-minor-version (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
-        work-dir               (str (io/file assembly-output-dir (str "work-" pipeline-short-name "-" (java.util.UUID/randomUUID))))
-        outdir                 (str (io/file assembly-output-dir))
-        log-file               (str (io/file outdir "nextflow.log"))
+        analysis-uuid          (java.util.UUID/randomUUID)
+        work-dir               (str (io/file output-dir (str "work-" pipeline-short-name "-" analysis-uuid)))
+        samplesheet-path       (str (File/createTempFile (str "assembly-input-" test) ".csv"))
+        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:library-id :r1-path :r2-path]) {:library-id :ID :r1-path :R1 :r2-path :R2}) libraries))
+        outdir                 (str (io/file output-dir))
+        ;;log-file               (str (io/file outdir "nextflow.log"))
         assembly-tool          (get-in @db [:config :routine-assembly-config :assembly-tool])
         annotation-tool        (get-in @db [:config :routine-assembly-config :annotation-tool])]
-    (do
-      (swap! db assoc :currently-analyzing libraries)
-      (log/info (str "Started " pipeline-short-name " analysis."))
+    (go
+      (do
+      #_(swap! db assoc :currently-analyzing libraries)
+      (log/info (str "Started " pipeline-short-name " analysis in directory: " outdir))
       (sh "mkdir" "-p" outdir)
       (sh "chmod" "750" outdir)
+      (with-open [writer (io/writer samplesheet-path)]
+        (csv/write-csv writer samplesheet-data))
       (sh "mkdir" "-p" work-dir)
       (sh "chmod" "750" work-dir)
       (shell/with-sh-dir outdir
-        (apply sh ["nextflow"
-                   "-log" log-file
-                   "run" pipeline-full-name
-                   "-profile" "conda"
-                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
-                   "-r" pipeline-full-version
-                   "--samplesheet_input" samplesheet
-                   (str "--" assembly-tool)
-                   (str "--" annotation-tool)
-                   "-work-dir" work-dir
-                   "--outdir" "."]))
+        (sh "nextflow"
+            "run" pipeline-full-name
+            "-profile" "conda"
+            "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+            "-r" pipeline-full-version
+            "--samplesheet_input" samplesheet-path
+            (str "--" assembly-tool)
+            (str "--" annotation-tool)
+            "-work-dir" work-dir
+            "--outdir" "."))
       
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
       (log/info (str "Finished " pipeline-short-name " analysis."))
-      (go (sh "rm" "-r" work-dir)))
-    outdir))
+      #_(go (sh "rm" "-r" work-dir))))))
 
 
 (defn run-mlst-nf!
@@ -765,42 +768,37 @@
 
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
-      #_(swap! db assoc :currently-analyzing nil)
       (log/info (str "Finished " pipeline-short-name " analysis."))
       (go (sh "rm" "-r" work-dir)))))
 
 
-(defn analyze!
-  "Run the two nextflow analysis pipelines on `run`.
-
-   takes:
-     `libraries`: _
-     `db`: Global app-state db. (`Atom`)
-
-   returns:
-    `nil`
-  "
-  [libraries db]
-  (-> (run-routine-assembly! libraries db)
-      (run-mlst-nf! db)))
+(defn demultiplex-analysis
+  ""
+  [library-to-analyze db]
+  (let [{:keys [library-id analysis-stage]} library-to-analyze]
+    (case analysis-stage
+      :assembly (do
+                  (log/info "Starting assembly on: " library-id)
+                  (run-routine-assembly! [library-to-analyze] db)
+                  ))))
 
 
 (defn start-analyzer!
-  "Starts the (asynchronous) process of analyzing any directories put on `runs-to-analyze-chan`.
+  "Starts the (asynchronous) process of analyzing any directories put on `libraries-to-analyze-chan`.
 
    takes:
-     `runs-to-analyse-chan`: Channel to take run directories from for analysis (`Channel`)
+     `libraries-to-analyze-chan`: Channel to take run directories from for analysis (`Channel`)
      `db`: Global app-state db (`Atom`)
 
    returns:
      (`Channel`)
   "
-  [runs-to-analyze-chan db]
-  (go-loop [run (<! runs-to-analyze-chan)]
-    (log/debug (str "Took from analysis channel: " run))
-    (when-some [r run]
-      (analyze! run db))
-    (recur (<! runs-to-analyze-chan))))
+  [libraries-to-analyze-chan db]
+  (go-loop [library (<! libraries-to-analyze-chan)]
+    (log/info (str "Took from analysis channel: " library))
+    (when-some [l library]
+      (demultiplex-analysis l db))
+    (recur (<! libraries-to-analyze-chan))))
 
 
 (defn -main
@@ -873,7 +871,7 @@
   (start-symlinker! runs-to-symlink-chan libraries-to-analyze-chan db)
   (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
 
-  #_(start-analyzer! runs-to-analyze-chan db)
+  (start-analyzer! libraries-to-analyze-chan db)
   #_(start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
 
   ;;
@@ -913,8 +911,8 @@
   (put-stop! kill-symlinking-chan)
  
   
-  (start-analyzer! runs-to-analyze-chan db)
-  (start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
+  (start-analyzer! libraries-to-analyze-chan db)
+  (start-scanning-for-libraries-to-analyze! libraries-to-analyze-chan kill-analysis-chan db)
   (put-stop! kill-analysis-chan)
   
   (defn mock-analyze!
@@ -924,5 +922,13 @@
       (swap! db assoc :currently-analyzing run-dir)
       (go (<! (timeout 10000))
           (swap! db assoc :currently-analyzing nil))))
+
+  (let [libraries [{:library-id "BC21A763A"
+                    :r1-path "/home/dfornika/code/analysis-automation/auto-cpo/test_output/fastq_symlinks/by_year/21/BC21A763A_R1.fastq.gz"
+                    :r2-path "/home/dfornika/code/analysis-automation/auto-cpo/test_output/fastq_symlinks/by_year/21/BC21A763A_R2.fastq.gz"}]]
+    (run-routine-assembly! libraries db))
   
+  (with-open [writer (io/writer "test.csv")]
+    (csv/write-csv writer (maps->csv-data [{:hello "world"
+                                            :goodbye "earth"}])))
   )
