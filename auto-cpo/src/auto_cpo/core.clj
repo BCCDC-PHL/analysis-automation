@@ -415,9 +415,9 @@
 
    returns:
      Sequence of maps, each with keys:
-       `:library-id` Library ID (`String`)
-       `:r1-path`    Path to R1 fastq file (`String`)
-       `:r2-path`    Path to R2 fastq file (`String`)
+       `:id`      Library ID (`String`)
+       `:r1-path` Path to R1 fastq file (`String`)
+       `:r2-path` Path to R2 fastq file (`String`)
   "
   [project-id run-dir]
   (let [run-id              (.getName (io/file run-dir))
@@ -433,7 +433,7 @@
                       r1-path  (first (filter #(re-find r1-regex %) fastq-src-paths))
                       r2-regex (re-pattern (str library-id "_S\\d+_L\\d+_R2_\\d+.fastq.gz"))
                       r2-path  (first (filter #(re-find r2-regex %) fastq-src-paths))]
-                      {:library-id   library-id
+                      {:id   library-id
                        :r1-path  r1-path
                        :r2-path  r2-path}))))))
 
@@ -450,7 +450,7 @@
    takes:
      `library-fastq-paths`:
        `Map` with keys:
-         `:library-id` Library ID (`String`)
+         `:id` Library ID (`String`)
          `:r1-path`    Path to R1 fastq file (`String`)
          `:r2-path`    Path to R2 fastq file (`String`)
       `fastq-symlinks-dir`: Path to directory to create fastq symlinks in (`String`)
@@ -459,7 +459,7 @@
      Sub-directory name (`String`)
   "
   [library-fastq-paths]
-  (let [library-id (:library-id library-fastq-paths)
+  (let [library-id (:id library-fastq-paths)
         current-year (first (str/split (now!) #"-"))
         current-two-digit-year (apply str (drop 2 current-year))
         library-year-regex #"BC(\d{2})[A-Z]"
@@ -489,34 +489,49 @@
       (second library-two-digit-year-matches))))
 
 
+(defn group-samples-by-year
+  "Given a collection of samples, identify the year of the sample based on the sample ID, and group
+   samples together by year.
+   takes:
+     `samples`: collection of samples. Each sample must include an `:id` key.
+  
+   returns:
+     Map of `String` to vector, with keys that are two-digit years and values that are collections
+     of samples. 
+  "
+  [samples]
+  (group-by #(library-id->year (:id %)) samples))
+
+
 (defn add-symlink-dest-path
   "Given a map of fastq file paths, add paths to symlink destinations.
 
    takes:
      `library-fastq-paths`:
        `Map` with keys:
-         `:library-id` Library ID (`String`)
-         `:r1-path`    Path to R1 fastq file (`String`)
-         `:r2-path`    Path to R2 fastq file (`String`)
+         `:id`      Library ID (`String`)
+         `:r1-path` Path to R1 fastq file (`String`)
+         `:r2-path` Path to R2 fastq file (`String`)
       `fastq-symlinks-dir`: Path to directory to create fastq symlinks in (`String`)
 
    returns:
      `Map` with keys:
-       `:library-id`   Library ID (`String`)
+       `:id`           Library ID (`String`)
        `:r1-src-path`  Path to R1 fastq file (`String`)
        `:r1-dest-path` Path to R1 fastq file (`String`)
        `:r2-src-path`  Path to R2 fastq file (`String`)
        `:r2-dest-path` Path to R2 fastq file (`String`)
   "
   [library-fastq-paths fastq-symlinks-dir]
-  (let [{:keys [library-id r1-path r2-path]} library-fastq-paths
+  (let [{:keys [r1-path r2-path]} library-fastq-paths
+        library-id (:id library-fastq-paths)
         library-id-year (library-id->year library-id)
         fastq-symlinks-subdir (if (nil? library-id-year) (apply str (drop 2 (first (str/split (now!) #"-")))) library-id-year)
         r1-src-path  r1-path
         r1-dest-path (str (io/file fastq-symlinks-dir fastq-symlinks-subdir (str library-id "_R1.fastq.gz")))
         r2-src-path  r2-path
         r2-dest-path (str (io/file fastq-symlinks-dir fastq-symlinks-subdir (str library-id "_R2.fastq.gz")))]
-    {:library-id   library-id
+    {:id           library-id
      :r1-src-path  r1-src-path
      :r1-dest-path r1-dest-path
      :r2-src-path  r2-src-path
@@ -528,7 +543,7 @@
 
    takes:
      `fastq-paths`: `Map` with keys:
-       `:library-id`   Library ID (`String`)
+       `:id`   Library ID (`String`)
        `:r1-src-path`  Path to source R1 fastq file (`String`)
        `:r1-dest-path` Path to destination R1 symlink (`String`)
        `:r2-src-path`  Path to source R2 fastq file (`String`)
@@ -536,17 +551,18 @@
 
    returns:
      `Map` with keys:
-       `:library-id`     Library ID
+       `:id`     Library ID
        `:r1-path`        Path to R1 fastq file (`String`)
        `:r2-path`        Path to R2 fastq file (`String`)
   "
   [fastq-paths db]
-  (let [{:keys [library-id r1-src-path r1-dest-path r2-src-path r2-dest-path]} fastq-paths
+  (let [{:keys [r1-src-path r1-dest-path r2-src-path r2-dest-path]} fastq-paths
+        library-id (:id fastq-paths)
         r1-symlink-exists (.exists (io/file r1-dest-path))
         r2-symlink-exists (.exists (io/file r2-dest-path))
         both-symlinks-exist (and r1-symlink-exists r2-symlink-exists)]
     (when (and (not both-symlinks-exist) (not (contains? (:excluded-library-ids @db) library-id)))
-      (let [library-to-analyze {:library-id library-id
+      (let [library-to-analyze {:id library-id
                                 :r1-path r1-dest-path
                                 :r2-path r2-dest-path}]
         (do
@@ -621,7 +637,7 @@
              (map #(add-symlink-dest-path % symlinks-dir))
              (#(for [library %] (symlink! library db)))
              (filter some?)
-             (assoc {:analysis-stage :assembly} :libraries)
+             (assoc {:analysis-stage :assembly} :samples)
              (put! analysis-chan)))
       (mark-as-symlinked db r))
 
@@ -663,7 +679,7 @@
 
    takes:
      `libraries`: Sequence of maps, each with keys:
-       `:library-id`: Library ID (`String`)
+       `:id`: Library ID (`String`)
        `:r1-path`: Path to R1 fastq file (`String`)
        `:r2-path`: Path to R2 fastq file (`String`)
      `db`: Global app-state db (`Atom`)
@@ -680,14 +696,14 @@
         analysis-uuid          (java.util.UUID/randomUUID)
         work-dir               (str (io/file output-dir (str "work-" pipeline-short-name "-" analysis-uuid)))
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
-        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:library-id :r1-path :r2-path]) {:library-id :ID :r1-path :R1 :r2-path :R2}) libraries))
+        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2}) libraries))
         outdir                 (str (io/file output-dir))
         ;;log-file               (str (io/file outdir "nextflow.log"))
         assembly-tool          (get-in @db [:config :routine-assembly-config :assembly-tool])
         annotation-tool        (get-in @db [:config :routine-assembly-config :annotation-tool])]
     (do
       
-      (doseq [library-id (map :library-id libraries)]
+      (doseq [library-id (map :id libraries)]
         (log/info "Starting" pipeline-short-name "on:" library-id))
 
       (sh "mkdir" "-p" outdir)
@@ -714,43 +730,46 @@
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
-      (doseq [library-id (map :library-id libraries)]
+      (doseq [library-id (map :id libraries)]
         (log/info "Finished" pipeline-short-name "on:" library-id))
 
-      (let [assemblies (map #(assoc (select-keys % [:library-id]) :assembly-path (first (find-files! outdir (str (:library-id %) "_" assembly-tool ".fa")))) libraries)]
+      (let [assemblies (map #(assoc (select-keys % [:id]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)
+            assemblies-with-reads (map #(assoc (select-keys % [:id :r1-path :r2-path]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)]
         (go (>! analysis-chan {:analysis-stage :mlst
-                               :assemblies assemblies})))
+                               :samples assemblies})
+            (>! analysis-chan {:analysis-stage :plasmid-screen
+                               :samples assemblies-with-reads})))
       (sh "rm" "-r" work-dir)
       (sh "rm" samplesheet-path))))
 
 
 (defn run-mlst-nf!
-  "Run the BCCDC-PHL/mlst-nf pipeline on an artic analysis directory.
+  "Run the BCCDC-PHL/mlst-nf pipeline on a collection of assemblies.
    When the analysis completes, delete the 'work' directory.
 
    takes:
      `assemblies`: Sequence of maps, each with keys:
-       `:library-id`: Library ID (`String`)
+       `:id`:            Library ID (`String`)
        `:assembly-path`: Path to assembly fasta file (`String`)
      `db`: Global app-state db (`Atom`)
    returns:
      `nil`
   "
   [assemblies db analysis-chan]
-  (let [pipeline-full-name      "BCCDC-PHL/mlst-nf"
-        pipeline-short-name     (second (str/split pipeline-full-name #"/"))
-        pipeline-full-version   (get-in @db [:config :mlst-nf-config :version])
-        pipeline-minor-version  (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
-        analysis-uuid           (java.util.UUID/randomUUID)
-        work-dir                (str (io/file (str "work-" pipeline-short-name "-" analysis-uuid)))
+  (let [pipeline-full-name     "BCCDC-PHL/mlst-nf"
+        pipeline-short-name    (second (str/split pipeline-full-name #"/"))
+        pipeline-full-version  (get-in @db [:config :mlst-nf-config :version])
+        pipeline-minor-version (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
+        analysis-uuid          (java.util.UUID/randomUUID)
+        work-dir               (str (io/file (str "work-" pipeline-short-name "-" analysis-uuid)))
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
-        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:library-id :assembly-path]) {:library-id :ID :assembly-path :ASSEMBLY}) assemblies))
-        outdir                  (get-in @db [:config :analysis-output-dir])
+        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :assembly-path]) {:id :ID :assembly-path :ASSEMBLY}) assemblies))
+        outdir                 (get-in @db [:config :analysis-output-dir])
         ;; log-file                (str (io/file outdir "nextflow.log"))
         ]
     (do
 
-      (doseq [library-id (map :library-id assemblies)]
+      (doseq [library-id (map :id assemblies)]
         (log/info "Starting" pipeline-short-name "on:" library-id))
 
       (sh "mkdir" "-p" outdir)
@@ -774,7 +793,68 @@
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
-      (doseq [library-id (map :library-id assemblies)]
+      (doseq [library-id (map :id assemblies)]
+        (log/info "Finished" pipeline-short-name "on:" library-id))
+
+      (go (sh "rm" "-r" work-dir)))))
+
+
+(defn run-plasmid-screen!
+  "Run the BCCDC-PHL/plasmid-screen pipeline on a collection of assemblies.
+   When the analysis completes, delete the 'work' directory.
+
+   takes:
+     `assemblies`: Sequence of maps, each with keys:
+       `:id`: Library ID (`String`)
+       `:assembly-path`: Path to assembly fasta file (`String`)
+       `:r1-path`: Path to R1 fastq file (`String`)
+       `:r2-path`: Path to R2 fastq file (`String`)
+     `db`: Global app-state db (`Atom`)
+   returns:
+     `nil`
+  "
+  [assemblies db analysis-chan]
+  (let [pipeline-full-name     "BCCDC-PHL/plasmid-screen"
+        pipeline-short-name    (second (str/split pipeline-full-name #"/"))
+        pipeline-full-version  (get-in @db [:config :plasmid-screen-config :version])
+        pipeline-minor-version (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
+        mob-suite-db           (get-in @db [:config :plasmid-screen-config :mob-suite-db])
+        analysis-uuid          (java.util.UUID/randomUUID)
+        work-dir               (str (io/file (str "work-" pipeline-short-name "-" analysis-uuid)))
+        samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
+        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :assembly-path :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2 :assembly-path :ASSEMBLY}) assemblies))
+        outdir                 (get-in @db [:config :analysis-output-dir])
+        ;; log-file                (str (io/file outdir "nextflow.log"))
+        ]
+    (do
+
+      (doseq [library-id (map :id assemblies)]
+        (log/info "Starting" pipeline-short-name "on:" library-id))
+
+      (sh "mkdir" "-p" outdir)
+      (sh "chmod" "750" outdir)
+      (with-open [writer (io/writer samplesheet-path)]
+          (csv/write-csv writer samplesheet-data))
+      (sh "mkdir" "-p" work-dir)
+      (sh "chmod" "750" work-dir)
+      (shell/with-sh-dir outdir
+        (apply sh ["nextflow"
+                   ;;"-log" log-file
+                   "run" pipeline-full-name
+                   "-profile" "conda"
+                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+                   "-r" pipeline-full-version
+                   "--pre_assembled"
+                   "--samplesheet_input" samplesheet-path
+                   "--mob_db" mob-suite-db
+                   "-work-dir" work-dir
+                   "--versioned_outdir"
+                   "--outdir" "."]))
+
+      (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
+      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
+
+      (doseq [library-id (map :id assemblies)]
         (log/info "Finished" pipeline-short-name "on:" library-id))
 
       (go (sh "rm" "-r" work-dir)))))
@@ -786,9 +866,9 @@
   (let [{:keys [analysis-stage]} to-analyze]
     (case analysis-stage
       :symlinking     (do)
-      :assembly       (run-routine-assembly! (:libraries to-analyze) db analysis-chan)
-      :mlst           (run-mlst-nf! (:assemblies to-analyze) db analysis-chan)
-      :plasmid-screen (do)
+      :assembly       (run-routine-assembly! (:samples to-analyze) db analysis-chan)
+      :mlst           (run-mlst-nf!          (:samples to-analyze) db analysis-chan)
+      :plasmid-screen (run-plasmid-screen!   (:samples to-analyze) db analysis-chan)
                   )))
 
 
@@ -806,7 +886,8 @@
   (go-loop [took (<! analysis-chan)]
     (log/info (str "Took from analysis channel: " took))
     (when-some [t took]
-      (demultiplex-analysis t db analysis-chan))
+      (let [by-year nil]
+        (demultiplex-analysis t db analysis-chan)))
     (recur (<! analysis-chan))))
 
 
@@ -932,7 +1013,7 @@
       (go (<! (timeout 10000))
           (swap! db assoc :currently-analyzing nil))))
 
-  (let [libraries [{:library-id "BC21A763A"
+  (let [libraries [{:id "BC21A763A"
                     :r1-path "/home/dfornika/code/analysis-automation/auto-cpo/test_output/fastq_symlinks/by_year/21/BC21A763A_R1.fastq.gz"
                     :r2-path "/home/dfornika/code/analysis-automation/auto-cpo/test_output/fastq_symlinks/by_year/21/BC21A763A_R2.fastq.gz"}]]
     (run-routine-assembly! libraries db))
