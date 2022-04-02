@@ -631,13 +631,15 @@
     (log/info (str "Took from symlink channel: " run))
     (when-some [r run]
       (let [symlinks-dir (get-in @db [:config :fastq-symlinks-dir])
-            project-id   (get-in @db [:config :samplesheet-project-id])]
+            project-id   (get-in @db [:config :samplesheet-project-id])
+            run-id (.getName (io/file run))
+            assembly-output-subdir (apply str (take 2 run-id))]
         (->> r
              (get-fastq-paths! project-id)
              (map #(add-symlink-dest-path % symlinks-dir))
              (#(for [library %] (symlink! library db)))
              (filter some?)
-             (assoc {:analysis-stage :assembly} :samples)
+             (assoc {:analysis-stage :assembly :output-subdir assembly-output-subdir} :samples)
              (put! analysis-chan)))
       (mark-as-symlinked db r))
 
@@ -682,13 +684,15 @@
        `:id`: Library ID (`String`)
        `:r1-path`: Path to R1 fastq file (`String`)
        `:r2-path`: Path to R2 fastq file (`String`)
+     `output-subdir`: Directory name for output sub-directory (below main output dir from config)
      `db`: Global app-state db (`Atom`)
+     `analysis-chan`: Channel to put values on for next analyses (`Channel`)
 
    returns:
      
   "
-  [libraries db analysis-chan]
-  (let [output-dir             (get-in @db [:config :analysis-output-dir])
+  [libraries output-subdir db analysis-chan]
+  (let [output-dir             (io/file (get-in @db [:config :analysis-output-dir]) output-subdir)
         pipeline-full-name     "BCCDC-PHL/routine-assembly"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
         pipeline-full-version  (get-in @db [:config :routine-assembly-config :version])
@@ -697,7 +701,7 @@
         work-dir               (str (io/file output-dir (str "work-" pipeline-short-name "-" analysis-uuid)))
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
         samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2}) libraries))
-        outdir                 (str (io/file output-dir))
+        outdir                 (str output-dir)
         ;;log-file               (str (io/file outdir "nextflow.log"))
         assembly-tool          (get-in @db [:config :routine-assembly-config :assembly-tool])
         annotation-tool        (get-in @db [:config :routine-assembly-config :annotation-tool])]
@@ -751,11 +755,13 @@
      `assemblies`: Sequence of maps, each with keys:
        `:id`:            Library ID (`String`)
        `:assembly-path`: Path to assembly fasta file (`String`)
+     `output-subdir`: Directory name for output sub-directory (below main output dir from config) (`String`)
      `db`: Global app-state db (`Atom`)
+     `analysis-chan`: Channel to put downstream analysis inputs into
    returns:
      `nil`
   "
-  [assemblies db analysis-chan]
+  [assemblies output-subdir db analysis-chan]
   (let [pipeline-full-name     "BCCDC-PHL/mlst-nf"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
         pipeline-full-version  (get-in @db [:config :mlst-nf-config :version])
@@ -764,7 +770,7 @@
         work-dir               (str (io/file (str "work-" pipeline-short-name "-" analysis-uuid)))
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
         samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :assembly-path]) {:id :ID :assembly-path :ASSEMBLY}) assemblies))
-        outdir                 (get-in @db [:config :analysis-output-dir])
+        outdir                 (str (io/file (get-in @db [:config :analysis-output-dir]) output-subdir))
         ;; log-file                (str (io/file outdir "nextflow.log"))
         ]
     (do
@@ -809,11 +815,12 @@
        `:assembly-path`: Path to assembly fasta file (`String`)
        `:r1-path`: Path to R1 fastq file (`String`)
        `:r2-path`: Path to R2 fastq file (`String`)
+     `output-subdir`: Directory name for output sub-directory (below main output dir from config) (`String`)
      `db`: Global app-state db (`Atom`)
    returns:
      `nil`
   "
-  [assemblies db analysis-chan]
+  [assemblies output-subdir db analysis-chan]
   (let [pipeline-full-name     "BCCDC-PHL/plasmid-screen"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
         pipeline-full-version  (get-in @db [:config :plasmid-screen-config :version])
@@ -823,7 +830,7 @@
         work-dir               (str (io/file (str "work-" pipeline-short-name "-" analysis-uuid)))
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
         samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :assembly-path :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2 :assembly-path :ASSEMBLY}) assemblies))
-        outdir                 (get-in @db [:config :analysis-output-dir])
+        outdir                 (str (io/file (get-in @db [:config :analysis-output-dir]) output-subdir))
         ;; log-file                (str (io/file outdir "nextflow.log"))
         ]
     (do
@@ -866,9 +873,9 @@
   (let [{:keys [analysis-stage]} to-analyze]
     (case analysis-stage
       :symlinking     (do)
-      :assembly       (run-routine-assembly! (:samples to-analyze) db analysis-chan)
-      :mlst           (run-mlst-nf!          (:samples to-analyze) db analysis-chan)
-      :plasmid-screen (run-plasmid-screen!   (:samples to-analyze) db analysis-chan)
+      :assembly       (run-routine-assembly! (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
+      :mlst           (run-mlst-nf!          (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
+      :plasmid-screen (run-plasmid-screen!   (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
                   )))
 
 
@@ -886,8 +893,11 @@
   (go-loop [took (<! analysis-chan)]
     (log/info (str "Took from analysis channel: " took))
     (when-some [t took]
-      (let [by-year nil]
-        (demultiplex-analysis t db analysis-chan)))
+      (let [analysis-stage (:analysis-stage t)
+            samples-by-year (group-samples-by-year (:samples t))]
+        (doseq [[year samples] samples-by-year]
+          (let [analysis-input {:analysis-stage analysis-stage :output-subdir year :samples samples}]
+              (demultiplex-analysis analysis-input db analysis-chan)))))
     (recur (<! analysis-chan))))
 
 
