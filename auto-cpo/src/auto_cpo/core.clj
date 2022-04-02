@@ -740,8 +740,10 @@
       (let [assemblies (map #(assoc (select-keys % [:id]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)
             assemblies-with-reads (map #(assoc (select-keys % [:id :r1-path :r2-path]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)]
         (go (>! analysis-chan {:analysis-stage :mlst
+                               :output-subdir output-subdir
                                :samples assemblies})
             (>! analysis-chan {:analysis-stage :plasmid-screen
+                               :output-subdir output-subdir
                                :samples assemblies-with-reads})))
       (sh "rm" "-r" work-dir)
       (sh "rm" samplesheet-path))))
