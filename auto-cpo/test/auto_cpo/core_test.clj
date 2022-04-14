@@ -25,30 +25,7 @@
 
 (defspec nextseq-directory-regex-property 100
   (prop/for-all [r tgen/nextseq-run-id]
-    (t/is (core/matches-run-directory-regex? r))))
-
-
-(t/deftest currently-analyzing-unit
-  (t/testing "Test that we don't determine that a run is analyzing with an empty `db`."
-    (let [run-id "220207_M00123_0123_000000000-A7TRG"
-          db (atom {})]
-      (t/is (not (core/currently-analyzing? run-id db)))))
-  (t/testing "Test that we don't determine that a run is analyzing when
-              value for `:currently-analyzing` in `db` is `nil`."
-    (let [run-id "220207_M00123_0123_000000000-A7TRG"
-          db (atom {:currently-analyzing nil})]
-      (t/is (not (core/currently-analyzing? run-id db)))))
-  (t/testing "Test that we do determine that we are analyzing a run when its run ID is
-              the value for `:currently-analyzing` in `db`."
-    (let [run-id "220207_M00123_0123_000000000-A7TRG"
-          db (atom {:currently-analyzing "220207_M00123_0123_000000000-A7TRG"})]
-      (t/is (core/currently-analyzing? run-id db)))))
-
-
-(defspec currently-analyzing-property 100
-  (prop/for-all [r (gen/one-of [tgen/miseq-run-id tgen/nextseq-run-id])]
-                (let [db (atom {:currently-analyzing r})]
-                  (t/is (core/currently-analyzing? r db)))))
+                (t/is (core/matches-run-directory-regex? r))))
 
 
 (t/deftest determine-sequencer-type-unit

@@ -31,6 +31,18 @@
   (.. (ZonedDateTime/now) (format DateTimeFormatter/ISO_OFFSET_DATE_TIME)))
 
 
+(defn now-by-second-only-digits!
+  "Generate a timestamp at second resolution with format (`YYYYMMDDHHmmss`).
+   Excludes any special characters like `-` and `:`, so useful for filenames.
+   eg: `20220211141349`
+  
+   takes:
+   returns:
+     Timestamp for the current time at second resolution, including only digits (`String`)"
+  []
+  (apply str (filter #(Character/isDigit %) (first (str/split (now!) #"\.")))))
+
+
 (defn load-edn!
   "Load edn from an io/reader source (filename or io/resource).
    https://clojuredocs.org/clojure.edn/read#example-5a68f384e4b09621d9f53a79
@@ -590,7 +602,7 @@
             run (first (scan-for-runs-to-symlink! db))]
         (when-some [r run]
           (do
-            (log/info "Found directory to symlink: " run)
+            (log/info "Found directory to symlink:" run)
             (>! runs-to-symlink-chan r))))
       (let [symlinks-scanning-interval (get-in @db [:config :symlinking-scanning-interval-ms] 10000)
             [v ch] (async/alts! [(timeout symlinks-scanning-interval) kill-chan])]
@@ -628,7 +640,7 @@
   "
   [runs-to-symlink-chan analysis-chan db]
   (go-loop [run (<! runs-to-symlink-chan)]
-    (log/info (str "Took from symlink channel: " run))
+    (log/debug (str "Took from symlink channel: " run))
     (when-some [r run]
       (let [symlinks-dir (get-in @db [:config :fastq-symlinks-dir])
             project-id   (get-in @db [:config :samplesheet-project-id])
@@ -639,9 +651,10 @@
              (map #(add-symlink-dest-path % symlinks-dir))
              (#(for [library %] (symlink! library db)))
              (filter some?)
-             (assoc {:analysis-stage :assembly :output-subdir assembly-output-subdir} :samples)
+             (assoc {:analysis-stage :taxon-abundance :output-subdir assembly-output-subdir} :samples)
              (put! analysis-chan)))
-      (mark-as-symlinked db r))
+      (mark-as-symlinked db r)
+      (log/info "Created symlinks for run:" r))
 
     (recur (<! runs-to-symlink-chan))))
 
@@ -675,6 +688,77 @@
       (str/split #"\n")))
 
 
+(defn run-taxon-abundance!
+  "Run the BCCDC-PHL/taxon-abundance pipeline on a set of libraries.
+   When the analysis completes, delete the 'work' directory.
+
+   takes:
+     `libraries`: Sequence of maps, each with keys:
+       `:id`: Library ID (`String`)
+       `:r1-path`: Path to R1 fastq file (`String`)
+       `:r2-path`: Path to R2 fastq file (`String`)
+     `output-subdir`: Directory name for output sub-directory (below main output dir from config)
+     `db`: Global app-state db (`Atom`)
+     `analysis-chan`: Channel to put values on for next analyses (`Channel`)
+
+   returns:
+     
+  "
+  [libraries output-subdir db analysis-chan]
+  (let [output-dir             (io/file (get-in @db [:config :analysis-output-dir]) output-subdir)
+        pipeline-full-name     "BCCDC-PHL/taxon-abundance"
+        pipeline-short-name    (second (str/split pipeline-full-name #"/"))
+        pipeline-full-version  (get-in @db [:config :taxon-abundance-config :version])
+        pipeline-minor-version (str/join "." (take 2 (str/split pipeline-full-version #"\.")))
+        analysis-uuid          (java.util.UUID/randomUUID)
+        work-dir               (str (io/file output-dir (str "work-" pipeline-short-name "-" analysis-uuid)))
+        samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
+        samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2}) libraries))
+        outdir                 (str output-dir)
+        log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
+        kraken-db-path         (get-in @db [:config :taxon-abundance-config :kraken-db])
+        bracken-db-path        (get-in @db [:config :taxon-abundance-config :bracken-db])]
+    (do
+      
+      (doseq [library-id (map :id libraries)]
+        (log/info "Starting" pipeline-short-name "on:" library-id))
+
+      (sh "mkdir" "-p" outdir)
+      (sh "chmod" "750" outdir)
+      (with-open [writer (io/writer samplesheet-path)]
+        (csv/write-csv writer samplesheet-data))
+      (sh "mkdir" "-p" work-dir)
+      (sh "chmod" "750" work-dir)
+
+      (shell/with-sh-dir outdir
+        (apply sh ["nextflow"
+                   "-log" log-file
+                   "run" pipeline-full-name
+                   "-profile" "conda"
+                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+                   "-r" pipeline-full-version
+                   "--samplesheet_input" samplesheet-path
+                   "--kraken_db" kraken-db-path
+                   "--bracken_db" bracken-db-path
+                   "-work-dir" work-dir
+                   "--versioned_outdir"
+                   "--outdir" "."]))
+
+      (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
+      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
+
+      (sh "rm" "-r" work-dir)
+      (sh "rm" samplesheet-path)
+
+      (doseq [library-id (map :id libraries)]
+        (log/info "Finished" pipeline-short-name "on:" library-id))
+
+      (go (>! analysis-chan {:analysis-stage :assembly
+                             :output-subdir output-subdir
+                             :samples libraries}))
+      )))
+
+
 (defn run-routine-assembly!
   "Run the BCCDC-PHL/routine-assembly pipeline on a run directory.
    When the analysis completes, delete the 'work' directory.
@@ -702,7 +786,7 @@
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
         samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2}) libraries))
         outdir                 (str output-dir)
-        ;;log-file               (str (io/file outdir "nextflow.log"))
+        log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         assembly-tool          (get-in @db [:config :routine-assembly-config :assembly-tool])
         annotation-tool        (get-in @db [:config :routine-assembly-config :annotation-tool])]
     (do
@@ -719,8 +803,8 @@
 
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
+                   "-log" log-file
                    "run" pipeline-full-name
-                   ;;"-log" log-file
                    "-profile" "conda"
                    "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
                    "-r" pipeline-full-version
@@ -734,6 +818,9 @@
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
+      (sh "rm" "-r" work-dir)
+      (sh "rm" samplesheet-path)
+
       (doseq [library-id (map :id libraries)]
         (log/info "Finished" pipeline-short-name "on:" library-id))
 
@@ -745,8 +832,7 @@
             (>! analysis-chan {:analysis-stage :plasmid-screen
                                :output-subdir output-subdir
                                :samples assemblies-with-reads})))
-      (sh "rm" "-r" work-dir)
-      (sh "rm" samplesheet-path))))
+      )))
 
 
 (defn run-mlst-nf!
@@ -773,7 +859,7 @@
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
         samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :assembly-path]) {:id :ID :assembly-path :ASSEMBLY}) assemblies))
         outdir                 (str (io/file (get-in @db [:config :analysis-output-dir]) output-subdir))
-        ;; log-file                (str (io/file outdir "nextflow.log"))
+        log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         ]
     (do
 
@@ -788,7 +874,7 @@
       (sh "chmod" "750" work-dir)
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
-                   ;;"-log" log-file
+                   "-log" log-file
                    "run" pipeline-full-name
                    "-profile" "conda"
                    "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
@@ -801,10 +887,13 @@
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
+      (sh "rm" "-r" work-dir)
+      (sh "rm" samplesheet-path)
+
       (doseq [library-id (map :id assemblies)]
         (log/info "Finished" pipeline-short-name "on:" library-id))
 
-      (go (sh "rm" "-r" work-dir)))))
+      )))
 
 
 (defn run-plasmid-screen!
@@ -833,7 +922,7 @@
         samplesheet-path       (str (File/createTempFile (str pipeline-short-name "-input-" analysis-uuid) ".csv"))
         samplesheet-data       (maps->csv-data (map #(set/rename-keys (select-keys % [:id :assembly-path :r1-path :r2-path]) {:id :ID :r1-path :R1 :r2-path :R2 :assembly-path :ASSEMBLY}) assemblies))
         outdir                 (str (io/file (get-in @db [:config :analysis-output-dir]) output-subdir))
-        ;; log-file                (str (io/file outdir "nextflow.log"))
+        log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         ]
     (do
 
@@ -848,7 +937,7 @@
       (sh "chmod" "750" work-dir)
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
-                   ;;"-log" log-file
+                   "-log" log-file
                    "run" pipeline-full-name
                    "-profile" "conda"
                    "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
@@ -863,10 +952,13 @@
       (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
       (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
+      (sh "rm" "-r" work-dir)
+      (sh "rm" samplesheet-path)
+
       (doseq [library-id (map :id assemblies)]
         (log/info "Finished" pipeline-short-name "on:" library-id))
 
-      (go (sh "rm" "-r" work-dir)))))
+      )))
 
 
 (defn demultiplex-analysis
@@ -874,10 +966,11 @@
   [to-analyze db analysis-chan]
   (let [{:keys [analysis-stage]} to-analyze]
     (case analysis-stage
-      :symlinking     (do)
-      :assembly       (run-routine-assembly! (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
-      :mlst           (run-mlst-nf!          (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
-      :plasmid-screen (run-plasmid-screen!   (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
+      :symlinking      (do)
+      :taxon-abundance (run-taxon-abundance!  (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
+      :assembly        (run-routine-assembly! (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
+      :mlst            (run-mlst-nf!          (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
+      :plasmid-screen  (run-plasmid-screen!   (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
                   )))
 
 
@@ -893,7 +986,7 @@
   "
   [analysis-chan db]
   (go-loop [took (<! analysis-chan)]
-    (log/info (str "Took from analysis channel: " took))
+    (log/debug (str "Took from analysis channel: " took))
     (when-some [t took]
       (let [analysis-stage (:analysis-stage t)
             samples-by-year (group-samples-by-year (:samples t))]
@@ -974,11 +1067,11 @@
   (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
 
   (start-analyzer! libraries-to-analyze-chan db)
-  #_(start-scanning-for-runs-to-analyze! runs-to-analyze-chan kill-analysis-chan db)
 
   ;;
   ;; Main loop
   (loop []
+    (Thread/sleep 10000)
     (recur)))
 
 
