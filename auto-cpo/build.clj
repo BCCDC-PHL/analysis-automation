@@ -3,7 +3,7 @@
 
 (def lib 'ca.bccdc-phl/auto-cpo)
 (def main-ns 'auto-cpo.core)
-(def version (format "0.1.0"))
+(def version (format "0.1.0-alpha"))
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
 (def uber-file (format "target/%s-%s-SNAPSHOT.jar" (name lib) version))
