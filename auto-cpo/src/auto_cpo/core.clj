@@ -163,37 +163,6 @@
     (.exists upload-complete-path)))
 
 
-(defn symlinks-complete?
-  "Check if symlinking is complete, based on the presence of a `symlinks_complete.json` file.
-  
-   takes:
-     `symlinks-dir`: Path to fastq symlinks dir. (`String`)
-
-   returns:
-     `Boolean`
-  "
-  [symlinks-dir]
-  (let [symlinks-complete-file (io/file symlinks-dir "symlinks_complete.json")]
-    (.exists symlinks-complete-file)))
-
-
-(defn analysis-dir-exists?
-  "Given a fastq symlinks directory, check if the corresponding
-   analysis output directory exists.
-
-   takes:
-     symlinks-dir: path (`String`)
-     analysis-output-dir path (`String`)
-
-   returns:
-     `Boolean`
-  "
-  [symlinks-dir analysis-output-dir]
-  (let [run-id (.getName (io/file symlinks-dir))
-        analysis-dir (io/file analysis-output-dir run-id)]
-    (.exists analysis-dir)))
-
-
 (defn scan-directory!
   "Scan a directory and return a list of all files in the directory.
 
@@ -219,8 +188,7 @@
 
    takes:
      `paths`: Sequence of paths to illumina sequencer output dirs. (`[String]`)
-     `symlinks-dir`: Top-level fastq symlinks dir. (`String`)
-     `excluded-run-ids`: Set of run IDs to exclude from symlinking (`#{String}`)
+     `db`: Global app-state db (`Atom`)
 
    returns:
      Filtered sequence of paths to illumina sequencer output dirs. (`[String]`)
@@ -550,6 +518,34 @@
      :r2-dest-path r2-dest-path}))
 
 
+(defn both-symlinks-exist?
+  "Check if symlinks for a library already exist.
+
+   takes:
+     `fastq-paths`: `Map` with keys:
+       `:r1-dest-path` Path to destination R1 symlink (`String`)
+       `:r2-dest-path` Path to destination R2 symlink (`String`)
+
+   returns:
+     `bool`, indicating whether or not both fastq symlinks already exist for that sample.
+  "
+  [fastq-paths]
+  (let [{:keys [r1-dest-path r2-dest-path]} fastq-paths
+        r1-symlink-exists (.exists (io/file r1-dest-path))
+        r2-symlink-exists (.exists (io/file r2-dest-path))]
+    (and r1-symlink-exists r2-symlink-exists)))
+
+
+(defn library-excluded?
+  "Check if the library is excluded from analysis, based on its ID
+   takes:
+     `library-id`: Identifier to check against list of excluded libraries (`String`)
+     `db`: Global app-state db
+  "
+  [library-id db]
+  (contains? (:excluded-library-ids @db) library-id))
+
+
 (defn symlink!
   "Create symlinks for the library in `fastq-paths`, under the directory associated with the key `:fastq-symlinks-dir` in `db`.
 
@@ -570,17 +566,13 @@
   [fastq-paths db]
   (let [{:keys [r1-src-path r1-dest-path r2-src-path r2-dest-path]} fastq-paths
         library-id (:id fastq-paths)
-        r1-symlink-exists (.exists (io/file r1-dest-path))
-        r2-symlink-exists (.exists (io/file r2-dest-path))
-        both-symlinks-exist (and r1-symlink-exists r2-symlink-exists)]
-    (when (and (not both-symlinks-exist) (not (contains? (:excluded-library-ids @db) library-id)))
-      (let [library-to-analyze {:id library-id
-                                :r1-path r1-dest-path
-                                :r2-path r2-dest-path}]
-        (do
-          (symlink-one! r1-src-path r1-dest-path)
-          (symlink-one! r2-src-path r2-dest-path))
-          library-to-analyze))))
+        library-to-analyze {:id library-id
+                            :r1-path r1-dest-path
+                            :r2-path r2-dest-path}]
+    (do
+      (symlink-one! r1-src-path r1-dest-path)
+      (symlink-one! r2-src-path r2-dest-path))
+    library-to-analyze))
 
 
 (defn start-scanning-for-runs-to-symlink!
@@ -626,7 +618,7 @@
     (if (not (contains? @db :symlinked-runs))
       (swap! db assoc :symlinked-runs #{run-id})
       (swap! db update :symlinked-runs conj run-id))))
-  
+
 
 (defn start-symlinker!
   "Starts the (asynchronous) process of symlinking any directories put on `runs-to-symlink-chan`.
@@ -645,13 +637,15 @@
       (let [symlinks-dir (get-in @db [:config :fastq-symlinks-dir])
             project-id   (get-in @db [:config :samplesheet-project-id])
             run-id (.getName (io/file run))
-            assembly-output-subdir (apply str (take 2 run-id))]
+            analysis-output-subdir (apply str (take 2 run-id))]
         (->> r
              (get-fastq-paths! project-id)
              (map #(add-symlink-dest-path % symlinks-dir))
+             (filter #(not (library-excluded? (:id %) db)))
+             (filter #(not (both-symlinks-exist? %)))
              (#(for [library %] (symlink! library db)))
              (filter some?)
-             (assoc {:analysis-stage :taxon-abundance :output-subdir assembly-output-subdir} :samples)
+             (assoc {:analysis-stage :taxon-abundance :output-subdir analysis-output-subdir} :samples)
              (put! analysis-chan)))
       (mark-as-symlinked db r)
       (log/info "Created symlinks for run:" r))
@@ -872,6 +866,7 @@
           (csv/write-csv writer samplesheet-data))
       (sh "mkdir" "-p" work-dir)
       (sh "chmod" "750" work-dir)
+
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
                    "-log" log-file
@@ -935,6 +930,7 @@
           (csv/write-csv writer samplesheet-data))
       (sh "mkdir" "-p" work-dir)
       (sh "chmod" "750" work-dir)
+
       (shell/with-sh-dir outdir
         (apply sh ["nextflow"
                    "-log" log-file
