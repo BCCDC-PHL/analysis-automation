@@ -19,6 +19,48 @@
   (:gen-class))
 
 
+;;
+;; Helpers
+(def spy #(do (log/info (str "spy: " %)) %))
+
+(defn update-vals
+  "Simplified version of update-vals, taken from:
+   https://github.com/clojure/clojure/blob/2b3ba822815981e7f76907a3b75e9ecc428f7656/src/clj/clojure/core.clj#L8008-L8022
+  "
+  [m f]
+  (reduce-kv (fn [acc k v] (assoc acc k (f v))) {} m))
+
+
+(defn timed-take!
+  "
+  "
+  ([batch-size timeout-time-ms ch]
+   (timed-take! batch-size timeout-time-ms ch nil))
+  ([batch-size timeout-time-ms ch buf-or-n]
+   (let [out (chan buf-or-n)]
+     (go (loop [x 0]
+           (when (< x batch-size)
+             (let [[v _] (async/alts! [ch (timeout timeout-time-ms)])]
+               (when (not (nil? v))
+                 (>! out v)
+                 (recur (inc x))))))
+         (async/close! out))
+     out)))
+
+
+(defn batch
+  ""
+  [in batch-size timeout-time-ms]
+  (let [out (chan)]
+    (go-loop []
+      (let [v (<! (->> (timed-take! batch-size timeout-time-ms in)
+                       (async/reduce conj nil)))]
+        (when (not (nil? v))
+          (>! out v))
+        (recur)))
+    out))
+
+
 (defn now!
   "Generate an ISO-8601 timestamp (`YYYY-MM-DDTHH:mm:ss.xxxx-OFFSET`).
    eg: `2022-02-11T14:13:49.9335-08:00`
@@ -74,6 +116,8 @@
      (into [headers] rows)))
 
 
+;;
+;; Config management
 (defn update-config!
   "Read config from file and insert into `db` under key `:config`.
 
@@ -85,7 +129,7 @@
      `nil`
   "
   [config-file-path db]
-  (if (.exists (io/file config-file-path))
+  (when (.exists (io/file config-file-path))
     (let [config (load-edn! config-file-path)]
       (swap! db (fn [x] (assoc x :config config))))))
 
@@ -106,7 +150,7 @@
       (dosync
        (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
        (doseq [exclude-file-path exclude-file-paths]
-         (if (.exists (io/file exclude-file-path))
+         (when (.exists (io/file exclude-file-path))
            (with-open [rdr (io/reader exclude-file-path)]
              (swap! db (fn [x] (assoc x :excluded-run-ids (set/union (:excluded-run-ids x) (into #{} (line-seq rdr)))))))))))))
 
@@ -127,11 +171,13 @@
       (dosync
        (swap! db (fn [x] (assoc x :excluded-library-ids #{})))
        (doseq [exclude-file-path exclude-file-paths]
-         (if (.exists (io/file exclude-file-path))
+         (when (.exists (io/file exclude-file-path))
            (with-open [rdr (io/reader exclude-file-path)]
              (swap! db (fn [x] (assoc x :excluded-library-ids (set/union (:excluded-library-ids x) (into #{} (line-seq rdr)))))))))))))
 
 
+;;
+;;
 (defn matches-run-directory-regex?
   "Check that the directory name matches one of the standard illumina directory name formats.
 
@@ -215,9 +261,7 @@
      Sequence of illumina run directory paths available for symlinking ([String])
   "
   [db]
-  (let [run-dirs              (get-in @db [:config :run-dirs])
-        symlinks-dir          (get-in @db [:config :fastq-symlinks-dir])
-        excluded-run-ids      (get @db :excluded-run-ids)]
+  (let [run-dirs (get-in @db [:config :run-dirs])]
     (-> (map scan-directory! run-dirs)
         flatten
         (filter-for-runs-to-symlink db))))
@@ -321,9 +365,9 @@
         samplesheet-lines (with-open [rdr (io/reader samplesheet-path)]
                             (-> (doall (line-seq rdr))))
         sequencer-type (determine-sequencer-type run-id)]
-    (cond (= (determine-sequencer-type run-id) :miseq)
+    (cond (= sequencer-type :miseq)
           (samplesheet/parse-project-library-ids-miseq samplesheet-lines project-id)
-          (= (determine-sequencer-type run-id) :nextseq)
+          (= sequencer-type :nextseq)
           (samplesheet/parse-project-library-ids-nextseq samplesheet-lines project-id)
           :else '())))
 
@@ -347,9 +391,7 @@
        ```
   "
   [run-dir db]
-  (let [symlinks-dir        (get-in @db [:config :fastq-symlinks-dir])
-        excluded-run-ids    (get @db :excluded-run-ids)
-        project-id          (get-in @db [:config :samplesheet-project-id])
+  (let [project-id          (get-in @db [:config :samplesheet-project-id])
         samplesheet-path    (find-samplesheet! run-dir)
         project-library-ids (get-project-library-ids-from-samplesheet! samplesheet-path project-id)]
     (map #(find-fastqs-by-library-id run-dir %) project-library-ids)))
@@ -372,14 +414,11 @@
     (let [src-path (java.nio.file.Paths/get src (into-array String []))
           dest-path (java.nio.file.Paths/get dest (into-array String []))
           dest-parent-dir (.getParentFile (io/file (str dest-path)))]
-      (do
-        (when (not (.exists dest-parent-dir))
-          (do
-            (log/info "Creating directory: " (str dest-parent-dir))
-            (io/make-parents (str dest-path))))
-        (java.nio.file.Files/deleteIfExists dest-path)
-        (java.nio.file.Files/createSymbolicLink dest-path src-path
-                                                (into-array java.nio.file.attribute.FileAttribute []))))
+      (when (not (.exists dest-parent-dir))
+        (io/make-parents (str dest-path)))
+      (java.nio.file.Files/deleteIfExists dest-path)
+      (java.nio.file.Files/createSymbolicLink dest-path src-path (into-array java.nio.file.attribute.FileAttribute [])))
+                                            
     (catch java.lang.NullPointerException e)
     (catch java.io.IOException e)
     (catch java.nio.file.FileAlreadyExistsException e)))
@@ -563,44 +602,56 @@
        `:r1-path`        Path to R1 fastq file (`String`)
        `:r2-path`        Path to R2 fastq file (`String`)
   "
-  [fastq-paths db]
-  (let [{:keys [r1-src-path r1-dest-path r2-src-path r2-dest-path]} fastq-paths
-        library-id (:id fastq-paths)
-        library-to-analyze {:id library-id
-                            :r1-path r1-dest-path
-                            :r2-path r2-dest-path}]
-    (do
+  [message-chan fastq-paths]
+  (let [library-id (:id fastq-paths)
+        {:keys [r1-src-path r1-dest-path r2-src-path r2-dest-path]} fastq-paths]
+    (go 
       (symlink-one! r1-src-path r1-dest-path)
-      (symlink-one! r2-src-path r2-dest-path))
-    library-to-analyze))
+      (symlink-one! r2-src-path r2-dest-path)
+      (let [message {:event :symlinks-created
+                     :timestamp (now!)
+                     :id library-id
+                     :library-id library-id
+                     :symlink-paths {:r1 r1-dest-path
+                                     :r2 r2-dest-path}}]
+        (>! message-chan {:topic :symlinking
+                          :message message})
+        (>! message-chan {:topic :analysis
+                          :message message})
+        (>! message-chan {:topic :logging
+                          :message {:log/level :info
+                                    :log/message message}})))))
 
 
 (defn start-scanning-for-runs-to-symlink!
   "Starts the (asynchronous) process of scanning for runs to symlink.
 
    takes:
-     `runs-to-symlink-chan`: Channel to put run directories on for symlinking. (`Channel`)
+     `message-chan`: Channel to put run directories on for symlinking. (`Channel`)
      `kill-chan`: Channel for killing the scanning process. (`Channel`)
      `db`: Global app-state db (`Atom`)
 
    returns:
      (`Channel`)
   "
-  [runs-to-symlink-chan kill-chan db]
+  [message-chan kill-chan db]
   (go-loop []
-    (do
-      (log/debug "Scanning for runs to symlink...")
-      (let [_ (update-excluded-runs! db)
-            run (first (scan-for-runs-to-symlink! db))]
-        (when-some [r run]
-          (do
-            (log/info "Found directory to symlink:" run)
-            (>! runs-to-symlink-chan r))))
-      (let [symlinks-scanning-interval (get-in @db [:config :symlinking-scanning-interval-ms] 10000)
-            [v ch] (async/alts! [(timeout symlinks-scanning-interval) kill-chan])]
-        (if (= ch kill-chan)
-          (log/info "Stopped scanning for runs to symlink.")
-          (recur))))))
+    (let [_ (update-excluded-runs! db)
+          run (first (scan-for-runs-to-symlink! db))]
+      (when-some [r run]
+        (let [message {:timestamp (now!)
+                       :event :run-directory-found
+                       :run-dir r}]
+          (>! message-chan {:topic :symlinking
+                            :message message})
+          (>! message-chan {:topic :logging
+                            :message {:log/level :info
+                                      :log/message message}}))))
+    (let [symlinks-scanning-interval (get-in @db [:config :symlinking-scanning-interval-ms] 2000)
+          [v ch] (async/alts! [(timeout symlinks-scanning-interval) kill-chan])]
+      (if (= ch kill-chan)
+        (log/info "Stopped scanning for runs to symlink.")
+        (recur)))))
 
 
 (defn mark-as-symlinked
@@ -621,36 +672,32 @@
 
 
 (defn start-symlinker!
-  "Starts the (asynchronous) process of symlinking any directories put on `runs-to-symlink-chan`.
+  "Starts the (asynchronous) process of symlinking any directories put on `symlink-chan`.
 
    takes:
-     `runs-to-symlink-chan`: Channel to take run directories from for symlinking (`Channel`)
+     `message-chan`:
+     `symlink-chan`: 
      `db`: Global app-state db (`Atom`)
 
    returns:
      (`Channel`)
   "
-  [runs-to-symlink-chan analysis-chan db]
-  (go-loop [run (<! runs-to-symlink-chan)]
-    (log/debug (str "Took from symlink channel: " run))
-    (when-some [r run]
+  [message-chan symlink-chan db]
+  (go-loop [took (<! symlink-chan)]
+    (when-some [message (if (= :run-directory-found (get-in took [:message :event])) (:message took) nil)]
       (let [symlinks-dir (get-in @db [:config :fastq-symlinks-dir])
             project-id   (get-in @db [:config :samplesheet-project-id])
-            run-id (.getName (io/file run))
-            analysis-output-subdir (apply str (take 2 run-id))]
-        (->> r
+            run-dir      (io/file (get-in message [:run-dir]))]
+        (->> (str run-dir)
              (get-fastq-paths! project-id)
              (map #(add-symlink-dest-path % symlinks-dir))
              (filter #(not (library-excluded? (:id %) db)))
              (filter #(not (both-symlinks-exist? %)))
-             (#(for [library %] (symlink! library db)))
-             (filter some?)
-             (assoc {:analysis-stage :taxon-abundance :output-subdir analysis-output-subdir} :samples)
-             (put! analysis-chan)))
-      (mark-as-symlinked db r)
-      (log/info "Created symlinks for run:" r))
-
-    (recur (<! runs-to-symlink-chan))))
+             (map (partial symlink! message-chan))
+             (doall))
+        (mark-as-symlinked db run-dir)
+        ))
+      (recur (<! symlink-chan))))
 
 
 (defn put-stop!
@@ -693,12 +740,12 @@
        `:r2-path`: Path to R2 fastq file (`String`)
      `output-subdir`: Directory name for output sub-directory (below main output dir from config)
      `db`: Global app-state db (`Atom`)
-     `analysis-chan`: Channel to put values on for next analyses (`Channel`)
+     `message-chan`: Channel to put values on for next analyses (`Channel`)
 
    returns:
      
   "
-  [libraries output-subdir db analysis-chan]
+  [libraries output-subdir db message-chan]
   (let [output-dir             (io/file (get-in @db [:config :analysis-output-dir]) output-subdir)
         pipeline-full-name     "BCCDC-PHL/taxon-abundance"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
@@ -715,7 +762,17 @@
     (do
       
       (doseq [library-id (map :id libraries)]
-        (log/info "Starting" pipeline-short-name "on:" library-id))
+        (let [message {:event :analysis-started
+                       :timestamp (now!)
+                       :pipeline-name pipeline-full-name
+                       :id library-id
+                       :library-id library-id}]
+          (go
+            (>! message-chan {:topic :analysis
+                              :message message})
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message message}}))))
 
       (sh "mkdir" "-p" outdir)
       (sh "chmod" "750" outdir)
@@ -745,12 +802,21 @@
       (sh "rm" samplesheet-path)
 
       (doseq [library-id (map :id libraries)]
-        (log/info "Finished" pipeline-short-name "on:" library-id))
-
-      (go (>! analysis-chan {:analysis-stage :assembly
-                             :output-subdir output-subdir
-                             :samples libraries}))
-      )))
+        (let [library-analysis-outdir (io/file outdir library-id (str/join "-" [pipeline-short-name pipeline-minor-version "output"]))
+              message {:event :analysis-completed
+                       :timestamp (now!)
+                       :pipeline-name pipeline-full-name
+                       :pipeline-version pipeline-full-version
+                       :id library-id
+                       :library-id library-id
+                       :outdir (str library-analysis-outdir)}]
+          (spit (io/file library-analysis-outdir "analysis_complete.json")
+                {:timestamp (now!)})
+          (go (>! message-chan {:topic :analysis
+                                :message message})
+              (>! message-chan {:topic :logging
+                                :message {:log/level :info
+                                          :log/message message}})))))))
 
 
 (defn run-routine-assembly!
@@ -783,50 +849,54 @@
         log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         assembly-tool          (get-in @db [:config :routine-assembly-config :assembly-tool])
         annotation-tool        (get-in @db [:config :routine-assembly-config :annotation-tool])]
-    (do
-      
+    
+    (doseq [library-id (map :id libraries)]
+      (log/info "Starting" pipeline-short-name "on:" library-id))
+    
+    (sh "mkdir" "-p" outdir)
+    (sh "chmod" "750" outdir)
+    (with-open [writer (io/writer samplesheet-path)]
+      (csv/write-csv writer samplesheet-data))
+    (sh "mkdir" "-p" work-dir)
+    (sh "chmod" "750" work-dir)
+
+    (shell/with-sh-dir outdir
+      (apply sh ["nextflow"
+                 "-log" log-file
+                 "run" pipeline-full-name
+                 "-profile" "conda"
+                 "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+                 "-r" pipeline-full-version
+                 "--samplesheet_input" samplesheet-path
+                 (str "--" assembly-tool)
+                 (str "--" annotation-tool)
+                 "-work-dir" work-dir
+                 "--versioned_outdir"
+                 "--outdir" "."]))
+
+    (let [timestamp-complete (now!)]
       (doseq [library-id (map :id libraries)]
-        (log/info "Starting" pipeline-short-name "on:" library-id))
+        (spit (io/file outdir library-id (str pipeline-short-name "-" pipeline-full-version "-output") "analysis_complete.json")
+              {:timestamp_complete timestamp-complete})))
+    
+    (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
+    (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
-      (sh "mkdir" "-p" outdir)
-      (sh "chmod" "750" outdir)
-      (with-open [writer (io/writer samplesheet-path)]
-        (csv/write-csv writer samplesheet-data))
-      (sh "mkdir" "-p" work-dir)
-      (sh "chmod" "750" work-dir)
+    (sh "rm" "-r" work-dir)
+    (sh "rm" samplesheet-path)
 
-      (shell/with-sh-dir outdir
-        (apply sh ["nextflow"
-                   "-log" log-file
-                   "run" pipeline-full-name
-                   "-profile" "conda"
-                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
-                   "-r" pipeline-full-version
-                   "--samplesheet_input" samplesheet-path
-                   (str "--" assembly-tool)
-                   (str "--" annotation-tool)
-                   "-work-dir" work-dir
-                   "--versioned_outdir"
-                   "--outdir" "."]))
+    (doseq [library-id (map :id libraries)]
+      (log/info "Finished" pipeline-short-name "on:" library-id))
 
-      (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
-      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
-
-      (sh "rm" "-r" work-dir)
-      (sh "rm" samplesheet-path)
-
-      (doseq [library-id (map :id libraries)]
-        (log/info "Finished" pipeline-short-name "on:" library-id))
-
-      (let [assemblies (map #(assoc (select-keys % [:id]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)
-            assemblies-with-reads (map #(assoc (select-keys % [:id :r1-path :r2-path]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)]
-        (go (>! analysis-chan {:analysis-stage :mlst
-                               :output-subdir output-subdir
-                               :samples assemblies})
-            (>! analysis-chan {:analysis-stage :plasmid-screen
-                               :output-subdir output-subdir
-                               :samples assemblies-with-reads})))
-      )))
+    (let [assemblies (map #(assoc (select-keys % [:id]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)
+          assemblies-with-reads (map #(assoc (select-keys % [:id :r1-path :r2-path]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)]
+      (go (>! analysis-chan {:analysis-stage :mlst
+                             :output-subdir output-subdir
+                             :samples assemblies})
+          (>! analysis-chan {:analysis-stage :plasmid-screen
+                             :output-subdir output-subdir
+                             :samples assemblies-with-reads})))
+    ))
 
 
 (defn run-mlst-nf!
@@ -855,40 +925,44 @@
         outdir                 (str (io/file (get-in @db [:config :analysis-output-dir]) output-subdir))
         log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         ]
-    (do
 
-      (doseq [library-id (map :id assemblies)]
-        (log/info "Starting" pipeline-short-name "on:" library-id))
+    (doseq [library-id (map :id assemblies)]
+      (log/info "Starting" pipeline-short-name "on:" library-id))
 
-      (sh "mkdir" "-p" outdir)
-      (sh "chmod" "750" outdir)
-      (with-open [writer (io/writer samplesheet-path)]
-          (csv/write-csv writer samplesheet-data))
-      (sh "mkdir" "-p" work-dir)
-      (sh "chmod" "750" work-dir)
+    (sh "mkdir" "-p" outdir)
+    (sh "chmod" "750" outdir)
+    (with-open [writer (io/writer samplesheet-path)]
+      (csv/write-csv writer samplesheet-data))
+    (sh "mkdir" "-p" work-dir)
+    (sh "chmod" "750" work-dir)
 
-      (shell/with-sh-dir outdir
-        (apply sh ["nextflow"
-                   "-log" log-file
+    (shell/with-sh-dir outdir
+      (apply sh ["nextflow"
+                 "-log" log-file
                    "run" pipeline-full-name
-                   "-profile" "conda"
-                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
-                   "-r" pipeline-full-version
-                   "--samplesheet_input" samplesheet-path
-                   "-work-dir" work-dir
-                   "--versioned_outdir"
-                   "--outdir" "."]))
+                 "-profile" "conda"
+                 "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+                 "-r" pipeline-full-version
+                 "--samplesheet_input" samplesheet-path
+                 "-work-dir" work-dir
+                 "--versioned_outdir"
+                 "--outdir" "."]))
 
-      (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
-      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
-
-      (sh "rm" "-r" work-dir)
-      (sh "rm" samplesheet-path)
-
+    (let [timestamp-complete (now!)]
       (doseq [library-id (map :id assemblies)]
-        (log/info "Finished" pipeline-short-name "on:" library-id))
+        (spit (io/file outdir library-id (str pipeline-short-name "-" pipeline-full-version "-output") "analysis_complete.json")
+              {:timestamp_complete timestamp-complete})))
+ 
+    (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
+    (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
-      )))
+    (sh "rm" "-r" work-dir)
+    (sh "rm" samplesheet-path)
+
+    (doseq [library-id (map :id assemblies)]
+      (log/info "Finished" pipeline-short-name "on:" library-id))
+
+    ))
 
 
 (defn run-plasmid-screen!
@@ -919,83 +993,197 @@
         outdir                 (str (io/file (get-in @db [:config :analysis-output-dir]) output-subdir))
         log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         ]
-    (do
 
+    (doseq [library-id (map :id assemblies)]
+      (log/info "Starting" pipeline-short-name "on:" library-id))
+    
+    (sh "mkdir" "-p" outdir)
+    (sh "chmod" "750" outdir)
+    (with-open [writer (io/writer samplesheet-path)]
+      (csv/write-csv writer samplesheet-data))
+    (sh "mkdir" "-p" work-dir)
+    (sh "chmod" "750" work-dir)
+
+    (shell/with-sh-dir outdir
+      (apply sh ["nextflow"
+                 "-log" log-file
+                 "run" pipeline-full-name
+                 "-profile" "conda"
+                 "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
+                 "-r" pipeline-full-version
+                 "--pre_assembled"
+                 "--samplesheet_input" samplesheet-path
+                 "--mob_db" mob-suite-db
+                 "-work-dir" work-dir
+                 "--versioned_outdir"
+                 "--outdir" "."]))
+
+    (let [timestamp-complete (now!)]
       (doseq [library-id (map :id assemblies)]
-        (log/info "Starting" pipeline-short-name "on:" library-id))
+        (spit (io/file outdir library-id (str pipeline-short-name "-" pipeline-full-version "-output") "analysis_complete.json")
+              {:timestamp_complete timestamp-complete})))
 
-      (sh "mkdir" "-p" outdir)
-      (sh "chmod" "750" outdir)
-      (with-open [writer (io/writer samplesheet-path)]
-          (csv/write-csv writer samplesheet-data))
-      (sh "mkdir" "-p" work-dir)
-      (sh "chmod" "750" work-dir)
+    (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
+    (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
+    
+    (sh "rm" "-r" work-dir)
+    (sh "rm" samplesheet-path)
 
-      (shell/with-sh-dir outdir
-        (apply sh ["nextflow"
-                   "-log" log-file
-                   "run" pipeline-full-name
-                   "-profile" "conda"
-                   "--cache" (str (io/file (System/getProperty "user.home") ".conda/envs"))
-                   "-r" pipeline-full-version
-                   "--pre_assembled"
-                   "--samplesheet_input" samplesheet-path
-                   "--mob_db" mob-suite-db
-                   "-work-dir" work-dir
-                   "--versioned_outdir"
-                   "--outdir" "."]))
+    (doseq [library-id (map :id assemblies)]
+      (log/info "Finished" pipeline-short-name "on:" library-id))
 
-      (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
-      (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
+    ))
 
-      (sh "rm" "-r" work-dir)
-      (sh "rm" samplesheet-path)
 
-      (doseq [library-id (map :id assemblies)]
-        (log/info "Finished" pipeline-short-name "on:" library-id))
+(defn group-analysis-events
+  "Takes a sequence of events, and groups them first by :event, then by the year (as indicated by the :id)
+  takes:
+    Sequence of maps, each with tags:
+     `:event`:
+     `:id`:
 
-      )))
+  returns:
+    Map, with structure:
+      { `event-key` { `id-year` [`events`]}}
+    eg:
+      `{:symlinks-created {\"21\" [{:event :symlinks-created :id \"BC21AXYZA\"}...]
+                           \"22\" [{:event :symlinks-created :id \"BC22AXYZA\"}...]}}`
+  "
+  [events]
+  (->> events
+       (group-by :event)
+       (#(update-vals % group-samples-by-year))))
 
+
+(defn symlinks-created-event->library
+  "
+
+  returns:
+    map with keys:
+      `:id`:
+      `:r1-path`:
+      `:r2-path`:
+  "
+  [event]
+  (let [id (:id event)
+        r1-path (get-in event [:symlink-paths :r1])
+        r2-path (get-in event [:symlink-paths :r2])]
+    {:id id
+     :r1-path r1-path
+     :r2-path r2-path}))
 
 (defn demultiplex-analysis
-  ""
-  [to-analyze db analysis-chan]
-  (let [{:keys [analysis-stage]} to-analyze]
-    (case analysis-stage
-      :symlinking      (do)
-      :taxon-abundance (run-taxon-abundance!  (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
-      :assembly        (run-routine-assembly! (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
-      :mlst            (run-mlst-nf!          (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
-      :plasmid-screen  (run-plasmid-screen!   (:samples to-analyze) (:output-subdir to-analyze) db analysis-chan)
-                  )))
+  "Takes a map of grouped
+  "
+  [[event-type events-by-year] message-chan db]
+  (case event-type
+    :symlinks-created (dorun (for [year (keys events-by-year)]
+                               (let [output-subdir year
+                                     libraries (map symlinks-created-event->library (get events-by-year year))]
+                                 (run-taxon-abundance! libraries output-subdir db message-chan))))
+    nil
+    )
+  )
 
 
 (defn start-analyzer!
   "Starts the (asynchronous) process of analyzing any directories put on `libraries-to-analyze-chan`.
 
    takes:
-     `libraries-to-analyze-chan`: Channel to take run directories from for analysis (`Channel`)
+     `message-chan`: (`Channel`)
+     `analysis-chan`: Channel to take run directories from for analysis (`Channel`)
      `db`: Global app-state db (`Atom`)
 
    returns:
      (`Channel`)
   "
-  [analysis-chan db]
-  (go-loop [took (<! analysis-chan)]
-    (log/debug (str "Took from analysis channel: " took))
-    (when-some [t took]
-      (let [analysis-stage (:analysis-stage t)
-            samples-by-year (group-samples-by-year (:samples t))]
-        (doseq [[year samples] samples-by-year]
-          (let [analysis-input {:analysis-stage analysis-stage :output-subdir year :samples samples}]
-              (demultiplex-analysis analysis-input db analysis-chan)))))
-    (recur (<! analysis-chan))))
+  [message-chan analysis-chan batched-analysis-chan db]
+  (go-loop [took (<! batched-analysis-chan)]
+    (when-some [messages (into [] (map :message took))]
+      (->> messages
+           (group-analysis-events)
+           (map #(demultiplex-analysis % message-chan db))
+           (dorun)))
+    (recur (<! batched-analysis-chan))))
+
+
+(defn analysis-output-dir-name->pipeline-data
+  "Parse a pipeline output directory to get data about the pipeline
+  
+   takes:
+     `dir-name`: The directory name where the pipeline output was written to.
+     eg: `plasmid-screen-v0.2-output`
+
+    returns:
+      Map with keys:
+        `:pipeline-name`
+        `:pipeline-version`
+  "
+  [dir-name]
+  (let [pipeline-short-name (first (str/split dir-name #"-v\d+\.\d+"))
+        pipeline-version (str/replace (re-find #"-v\d+\.\d+-" "plasmid-screen-v0.2-output") "-" "")]
+    {:pipeline-name (str "BCCDC-PHL/" pipeline-short-name)
+     :pipeline-version pipeline-version}))
+
+
+(defn scan-completed-analyses!
+  "
+  takes:
+    `db`: Global app-stated db (`Atom`)
+
+  returns:
+    Sequence of maps, each with keys:
+      `:library-id`:
+      `:pipeline-name`:
+      `:pipeline-version`:
+      `:output-subdir`:
+  "
+  [db]
+  (let [analysis-outdir (get-in @db [:config :analysis-output-dir])
+        analysis-outdirs-by-year (scan-directory! analysis-outdir)
+        analysis-outdirs-by-sample (filter #(not (or (re-find #"^\." (.getName (io/file %)))
+                                                     (re-find #"^work" (.getName (io/file %)))))
+                                           (mapcat scan-directory! analysis-outdirs-by-year))
+        analysis-outdirs-by-pipeline (mapcat scan-directory! analysis-outdirs-by-sample)]
+    (->> analysis-outdirs-by-pipeline
+         (filter #(.exists (io/file % "analysis_complete.json")))
+         (map #(str/split % #"/"))
+         
+         (map #(let [library-id (last (butlast %))
+                     analysis-output-dir (last %)
+                     pipeline-data (analysis-output-dir-name->pipeline-data analysis-output-dir)
+                     year (library-id->year library-id)
+                     output-subdir (str (io/file year library-id analysis-output-dir))]
+                 (merge pipeline-data 
+                        {:id library-id
+                         :library-id library-id
+                         :output-subdir output-subdir}))))))
+
+
+(defn scan-symlinked-libraries!
+  "
+  takes:
+    `db`: Global app-stated db (`Atom`)
+  
+  returns:
+    IDs for Libraries that have been symlinked (`#{String}`)
+  "
+  [db]
+  (let [fastq-symlinks-dir (get-in @db [:config :fastq-symlinks-dir])
+        fastq-symlinks-dirs-by-year (scan-directory! fastq-symlinks-dir)]
+    (->> fastq-symlinks-dirs-by-year
+         (mapcat scan-directory!)
+         (map #(.getName (io/file %)))
+         (map #(first (str/split % #"_")))
+         (into #{}))))
 
 
 (defn -main
   "Main entry point"
   [& args]
 
+  
+  
   ;;
   ;; Command-line argument parsing
   (def opts (parse-opts args cli/options))
@@ -1016,7 +1204,7 @@
   ;;
   ;; In-memory db for co-ordinated state
   (defonce db (atom {}))
-  
+
   ;;
   ;; Load config to db
   ;; Loads once synchronously, then asynchronously refresh every 60 seconds
@@ -1052,21 +1240,50 @@
       (<! (timeout exclude-files-reload-interval))
       (recur)))
 
+  ;; Channels, pubs & subs
+  (defonce message-chan (chan))
+  (defonce kill-message-chan (chan))
+
+  (defonce logging-chan (chan))
+  (defonce kill-logging-chan (chan))
   
-  (defonce runs-to-symlink-chan (chan))
+  (defonce symlinking-chan (chan))
   (defonce kill-symlinking-chan (chan))
 
-  (defonce libraries-to-analyze-chan (chan))
+  (defonce analysis-chan (chan))
+  (let [analysis-batch-max-size (get-in @db [:config :analysis-batch-max-size])
+        analysis-batch-timeout-ms (get-in @db [:config :analysis-batch-timeout-ms])]
+    (defonce batched-analysis-chan (batch analysis-chan analysis-batch-max-size analysis-batch-timeout-ms)))
+  
   (defonce kill-analysis-chan (chan))
+  
+  (defonce message-pub (async/pub message-chan :topic))
 
-  (start-symlinker! runs-to-symlink-chan libraries-to-analyze-chan db)
-  (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
+  (async/sub message-pub :logging logging-chan)
+  (async/sub message-pub :symlinking symlinking-chan)
+  (async/sub message-pub :analysis analysis-chan)
 
-  (start-analyzer! libraries-to-analyze-chan db)
+  ;;
+  ;; 
+  (start-symlinker! message-chan symlinking-chan db)
+  (start-scanning-for-runs-to-symlink! message-chan kill-symlinking-chan db)
+
+  (start-analyzer! message-chan analysis-chan batched-analysis-chan db)
+
+  ;;
+  ;; Log any messages from the logging-chan
+  (go-loop [took (<! logging-chan)]
+    (when-some [msg (:message took)]
+      (log/info (:log/message msg )))
+      (recur (<! logging-chan)))
 
   ;;
   ;; Main loop
   (loop []
+    #_(>!! message-chan {:topic :logging
+                         :message {:log/level :info
+                                   :log/message {:event :main-loop
+                                                 :timestamp (now!)}}})
     (Thread/sleep 10000)
     (recur)))
 
@@ -1090,29 +1307,21 @@
   (swap! db (fn [x] (assoc x :excluded-run-ids #{})))
 
 
-  (defonce runs-to-symlink-chan (chan))
+  (defonce symlinking-chan (chan))
   (defonce kill-symlinking-chan (chan))
 
-  (defonce libraries-to-analyze-chan (chan))
+  (defonce analysis-chan (chan))
   (defonce kill-analysis-chan (chan))
 
   ;; Control symlinking process
-  (start-symlinker! runs-to-symlink-chan libraries-to-analyze-chan db)
-  (start-scanning-for-runs-to-symlink! runs-to-symlink-chan kill-symlinking-chan db)
+  (start-symlinker! message-chan symlinking-chan db)
+  (start-scanning-for-runs-to-symlink! message-chan symlinking-chan db)
   (put-stop! kill-symlinking-chan)
  
   
   (start-analyzer! libraries-to-analyze-chan db)
   (start-scanning-for-libraries-to-analyze! libraries-to-analyze-chan kill-analysis-chan db)
   (put-stop! kill-analysis-chan)
-  
-  (defn mock-analyze!
-    "Mock analysis by sleeping for 10s"
-    [run-dir db]
-    (do
-      (swap! db assoc :currently-analyzing run-dir)
-      (go (<! (timeout 10000))
-          (swap! db assoc :currently-analyzing nil))))
 
   (let [libraries [{:id "BC21A763A"
                     :r1-path "/home/dfornika/code/analysis-automation/auto-cpo/test_output/fastq_symlinks/by_year/21/BC21A763A_R1.fastq.gz"
