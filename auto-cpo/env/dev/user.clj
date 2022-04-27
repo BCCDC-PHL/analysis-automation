@@ -4,8 +4,10 @@
 
 (def opts {:options {:config "dev-config.edn"}})
 
-(core/update-config! (get-in opts [:options :config]) core/db)
+(comment
+  (core/update-config! (get-in opts [:options :config]) core/db)
 
-(core/update-excluded-runs! core/db)
+  (core/update-excluded-runs! core/db)
 
-(core/update-excluded-libraries! core/db)
+  (core/update-excluded-libraries! core/db)
+)
