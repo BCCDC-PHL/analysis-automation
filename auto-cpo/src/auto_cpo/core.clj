@@ -830,12 +830,12 @@
        `:r2-path`: Path to R2 fastq file (`String`)
      `output-subdir`: Directory name for output sub-directory (below main output dir from config)
      `db`: Global app-state db (`Atom`)
-     `analysis-chan`: Channel to put values on for next analyses (`Channel`)
+     `message-chan`: Channel to put values on for next analyses (`Channel`)
 
    returns:
      
   "
-  [libraries output-subdir db analysis-chan]
+  [libraries output-subdir db message-chan]
   (let [output-dir             (io/file (get-in @db [:config :analysis-output-dir]) output-subdir)
         pipeline-full-name     "BCCDC-PHL/routine-assembly"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
@@ -849,9 +849,19 @@
         log-file               (str (io/file (get-in @db [:config :nextflow-logs-dir]) (str (now-by-second-only-digits!) "-" pipeline-short-name "-nextflow.log")))
         assembly-tool          (get-in @db [:config :routine-assembly-config :assembly-tool])
         annotation-tool        (get-in @db [:config :routine-assembly-config :annotation-tool])]
-    
+
     (doseq [library-id (map :id libraries)]
-      (log/info "Starting" pipeline-short-name "on:" library-id))
+      (let [message {:event :analysis-started
+                     :timestamp (now!)
+                     :pipeline-name pipeline-full-name
+                     :id library-id
+                     :library-id library-id}]
+        (go
+          (>! message-chan {:topic :analysis
+                            :message message})
+          (>! message-chan {:topic :logging
+                            :message {:log/level :info
+                                      :log/message message}}))))
     
     (sh "mkdir" "-p" outdir)
     (sh "chmod" "750" outdir)
@@ -874,29 +884,44 @@
                  "--versioned_outdir"
                  "--outdir" "."]))
 
-    (let [timestamp-complete (now!)]
-      (doseq [library-id (map :id libraries)]
-        (spit (io/file outdir library-id (str pipeline-short-name "-" pipeline-full-version "-output") "analysis_complete.json")
-              {:timestamp_complete timestamp-complete})))
-    
+    (doseq [library libraries]
+      (let [library-id (:id library)
+            r1-path (:r1-path library)
+            r2-path (:r2-path library)
+            library-analysis-outdir (io/file outdir library-id (str/join "-" [pipeline-short-name pipeline-minor-version "output"]))
+            now (now!)
+            analysis-completed-message {:event :analysis-completed
+                                        :timestamp now
+                                        :pipeline-name pipeline-full-name
+                                        :pipeline-version pipeline-full-version
+                                        :id library-id
+                                        :library-id library-id
+                                        :outdir (str library-analysis-outdir)}
+            assembly-completed-message {:event :assembly-completed
+                                        :timestamp now
+                                        :assembly-tool assembly-tool
+                                        :annotation-tool annotation-tool
+                                        :id library-id
+                                        :library-id library-id
+                                        :r1-path r1-path
+                                        :r2-path r2-path
+                                        :assembly-path (str (io/file library-analysis-outdir (str library-id "_" assembly-tool ".fa")))}]
+        (spit (io/file library-analysis-outdir "analysis_complete.json")
+              {:timestamp (now!)})
+        (go (>! message-chan {:topic :analysis
+                              :message assembly-completed-message})
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message analysis-completed-message}})
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message assembly-completed-message}}))))
+      
     (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
     (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
     (sh "rm" "-r" work-dir)
-    (sh "rm" samplesheet-path)
-
-    (doseq [library-id (map :id libraries)]
-      (log/info "Finished" pipeline-short-name "on:" library-id))
-
-    (let [assemblies (map #(assoc (select-keys % [:id]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)
-          assemblies-with-reads (map #(assoc (select-keys % [:id :r1-path :r2-path]) :assembly-path (first (find-files! outdir (str (:id %) "_" assembly-tool ".fa")))) libraries)]
-      (go (>! analysis-chan {:analysis-stage :mlst
-                             :output-subdir output-subdir
-                             :samples assemblies})
-          (>! analysis-chan {:analysis-stage :plasmid-screen
-                             :output-subdir output-subdir
-                             :samples assemblies-with-reads})))
-    ))
+    (sh "rm" samplesheet-path)))
 
 
 (defn run-mlst-nf!
@@ -909,11 +934,11 @@
        `:assembly-path`: Path to assembly fasta file (`String`)
      `output-subdir`: Directory name for output sub-directory (below main output dir from config) (`String`)
      `db`: Global app-state db (`Atom`)
-     `analysis-chan`: Channel to put downstream analysis inputs into
+     `message-chan`: Channel to put downstream analysis inputs into
    returns:
      `nil`
   "
-  [assemblies output-subdir db analysis-chan]
+  [assemblies output-subdir db message-chan]
   (let [pipeline-full-name     "BCCDC-PHL/mlst-nf"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
         pipeline-full-version  (get-in @db [:config :mlst-nf-config :version])
@@ -927,7 +952,17 @@
         ]
 
     (doseq [library-id (map :id assemblies)]
-      (log/info "Starting" pipeline-short-name "on:" library-id))
+      (let [message {:event :analysis-started
+                     :timestamp (now!)
+                     :pipeline-name pipeline-full-name
+                     :id library-id
+                     :library-id library-id}]
+        (go
+          (>! message-chan {:topic :analysis
+                            :message message})
+          (>! message-chan {:topic :logging
+                            :message {:log/level :info
+                                      :log/message message}}))))
 
     (sh "mkdir" "-p" outdir)
     (sh "chmod" "750" outdir)
@@ -948,21 +983,39 @@
                  "--versioned_outdir"
                  "--outdir" "."]))
 
-    (let [timestamp-complete (now!)]
-      (doseq [library-id (map :id assemblies)]
-        (spit (io/file outdir library-id (str pipeline-short-name "-" pipeline-full-version "-output") "analysis_complete.json")
-              {:timestamp_complete timestamp-complete})))
+    (doseq [assembly assemblies]
+      (let [library-id (:library-id assembly)
+            library-analysis-outdir (io/file outdir library-id (str/join "-" [pipeline-short-name pipeline-minor-version "output"]))
+            now (now!)
+            analysis-completed-message {:event :analysis-completed
+                                        :timestamp now
+                                        :pipeline-name pipeline-full-name
+                                        :pipeline-version pipeline-full-version
+                                        :id library-id
+                                        :library-id library-id
+                                        :outdir (str library-analysis-outdir)}
+            mlst-completed-message {:event :mlst-completed
+                                        :timestamp now
+                                        :id library-id
+                                        :library-id library-id
+                                        :mlst-sequence-type-path (str (io/file library-analysis-outdir (str library-id "_sequence_type.csv")))}]
+        (spit (io/file library-analysis-outdir "analysis_complete.json")
+              {:timestamp (now!)})
+        (go (>! message-chan {:topic :analysis
+                              :message mlst-completed-message})
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message analysis-completed-message}})
+            ;; remove this one after debugging
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message mlst-completed-message}}))))
  
     (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
     (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
 
     (sh "rm" "-r" work-dir)
-    (sh "rm" samplesheet-path)
-
-    (doseq [library-id (map :id assemblies)]
-      (log/info "Finished" pipeline-short-name "on:" library-id))
-
-    ))
+    (sh "rm" samplesheet-path)))
 
 
 (defn run-plasmid-screen!
@@ -977,10 +1030,11 @@
        `:r2-path`: Path to R2 fastq file (`String`)
      `output-subdir`: Directory name for output sub-directory (below main output dir from config) (`String`)
      `db`: Global app-state db (`Atom`)
+     `message-chan`:
    returns:
      `nil`
   "
-  [assemblies output-subdir db analysis-chan]
+  [assemblies output-subdir db message-chan]
   (let [pipeline-full-name     "BCCDC-PHL/plasmid-screen"
         pipeline-short-name    (second (str/split pipeline-full-name #"/"))
         pipeline-full-version  (get-in @db [:config :plasmid-screen-config :version])
@@ -995,7 +1049,17 @@
         ]
 
     (doseq [library-id (map :id assemblies)]
-      (log/info "Starting" pipeline-short-name "on:" library-id))
+      (let [message {:event :analysis-started
+                     :timestamp (now!)
+                     :pipeline-name pipeline-full-name
+                     :id library-id
+                     :library-id library-id}]
+        (go
+          (>! message-chan {:topic :analysis
+                            :message message})
+          (>! message-chan {:topic :logging
+                            :message {:log/level :info
+                                      :log/message message}}))))
     
     (sh "mkdir" "-p" outdir)
     (sh "chmod" "750" outdir)
@@ -1018,21 +1082,39 @@
                  "--versioned_outdir"
                  "--outdir" "."]))
 
-    (let [timestamp-complete (now!)]
-      (doseq [library-id (map :id assemblies)]
-        (spit (io/file outdir library-id (str pipeline-short-name "-" pipeline-full-version "-output") "analysis_complete.json")
-              {:timestamp_complete timestamp-complete})))
+    (doseq [assembly assemblies]
+      (let [library-id (:library-id assembly)
+            library-analysis-outdir (io/file outdir library-id (str/join "-" [pipeline-short-name pipeline-minor-version "output"]))
+            now (now!)
+            analysis-completed-message {:event :analysis-completed
+                                        :timestamp now
+                                        :pipeline-name pipeline-full-name
+                                        :pipeline-version pipeline-full-version
+                                        :id library-id
+                                        :library-id library-id
+                                        :outdir (str library-analysis-outdir)}
+            plasmid-screen-completed-message {:event :plasmid-screen-completed
+                                              :timestamp now
+                                              :id library-id
+                                              :library-id library-id
+                                              :resistance-gene-report-path (str (io/file library-analysis-outdir (str library-id "_resistance_gene_report.tsv")))}]
+        (spit (io/file library-analysis-outdir "analysis_complete.json")
+              {:timestamp (now!)})
+        (go (>! message-chan {:topic :analysis
+                              :message plasmid-screen-completed-message})
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message analysis-completed-message}})
+            ;; remove this one after debugging
+            (>! message-chan {:topic :logging
+                              :message {:log/level :info
+                                        :log/message plasmid-screen-completed-message}}))))
 
     (sh "find" outdir "-type" "d" "-exec" "chmod" "750" "{}" "+")
     (sh "find" outdir "-type" "f" "-exec" "chmod" "640" "{}" "+")
     
     (sh "rm" "-r" work-dir)
-    (sh "rm" samplesheet-path)
-
-    (doseq [library-id (map :id assemblies)]
-      (log/info "Finished" pipeline-short-name "on:" library-id))
-
-    ))
+    (sh "rm" samplesheet-path)))
 
 
 (defn group-analysis-events
@@ -1072,6 +1154,7 @@
      :r1-path r1-path
      :r2-path r2-path}))
 
+
 (defn demultiplex-analysis
   "Takes a map of grouped
   "
@@ -1080,7 +1163,13 @@
     :symlinks-created (dorun (for [year (keys events-by-year)]
                                (let [output-subdir year
                                      libraries (map symlinks-created-event->library (get events-by-year year))]
-                                 (run-taxon-abundance! libraries output-subdir db message-chan))))
+                                 (go (run-routine-assembly! libraries output-subdir db message-chan))
+                                 (go (run-taxon-abundance! libraries output-subdir db message-chan)))))
+    :assembly-completed (dorun (for [year (keys events-by-year)]
+                                 (let [output-subdir year
+                                       assemblies (get events-by-year year)]
+                                   (go (run-mlst-nf! assemblies output-subdir db message-chan))
+                                   (go (run-plasmid-screen! assemblies output-subdir db message-chan)))))
     nil
     )
   )
